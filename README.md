@@ -172,11 +172,20 @@ The store works out of the box from the built-in catalog; set `MODULE_STORE_INDE
 
 The new `shortcuts` module provides personal shortcuts such as `.shortcut add gp ping`, persisted per tenant.
 
-## v13 UI upgrade
-See `README_V13_HIKKA_PLUS.md` for the new Command Center, Module Center, native dashboard controls, Store UI, Quick Panel and Control Bot admin/customer buttons.
 
-## v13.1.0 UI update
+## Nexus Module Store
 
-Interactive UI is now used across command, module and store browsers. `.cmds`, `.modules` and `.inline` have paginated inline keyboards; Control Bot status/modules/connect views also expose navigation buttons. The Store lifecycle and callback handler were hardened for reloads.
+Public catalog: `/store`
+Admin catalog/editor: `/admin/store`
 
-> v13.3.0 UI note: interactive inline buttons are published by the Control Bot, because Telegram callback queries belong to bot messages.
+Publish from Control Bot (admin): reply to a `.py` document with:
+`/storeadd name version category`
+
+List/delete from Control Bot:
+`/storelist` and `/storedelete name`
+
+A published module is stored in PostgreSQL. Tenant workers install the stored source directly, so the catalog does not depend on Render's ephemeral filesystem.
+
+## Module dependencies
+
+The runtime ships with Telethon 1.45.0 because many third-party modules import it. This fixes a missing-package error at import time. It does not automatically make arbitrary Hikka modules compatible: Hikka uses a Telethon-oriented runtime with its own loader, module registry, utils and decorators. Simple Telethon-dependent Nexus modules can work once their dependencies are present; full Hikka modules need an adapter/port.
