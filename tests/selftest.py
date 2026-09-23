@@ -157,7 +157,7 @@ def test_v12_features() -> None:
     inline = (MODULES / "inline.py").read_text(encoding="utf-8")
     shortcuts = (MODULES / "shortcuts.py").read_text(encoding="utf-8")
     assert "PAGE_SIZE = 8" in manager
-    assert "favcmd" in manager and "cmdhub:" in manager
+    assert "favcmd" in manager and "cmdhub:" in manager and "@callback" in manager
     assert "_builtin_catalog" in store and "store uninstall" in store
     assert "_show_commands" in inline and "cmdfav" in inline and "mods_store" in inline
     assert "class Module(BaseModule)" in shortcuts and "shortcut add" in shortcuts
