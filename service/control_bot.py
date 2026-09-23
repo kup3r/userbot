@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
+import re
 import logging
 import time
 import uuid
@@ -29,6 +31,7 @@ from aiogram.types import (
 from core.config import Config
 
 from .manager import TenantManager
+from .module_store import NAME_RE, SourceAnalysis, analyze_source, scan_text_for_display
 from .phone_login import PhoneLoginManager
 
 
@@ -94,6 +97,15 @@ class ControlBot:
                 reply_markup=self._home_keyboard(),
             )
 
+        @r.message(Command("menu"))
+        async def menu_command(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            if message.chat.type != "private":
+                await message.answer("Открой меня в личном чате.")
+                return
+            user = await self.manager.register(message.from_user)
+            await message.answer(self._user_home(user), reply_markup=self._home_keyboard())
+
         @r.message(Command("help"))
         async def help_command(message: Message) -> None:
             await message.answer(
@@ -107,10 +119,12 @@ class ControlBot:
                 "/disconnect — удалить сессию и остановить worker\n"
                 "/modules — модули\n"
                 "/module name on|off — включить/выключить модуль\n"
+                "/menu — открыть интерактивное меню\n"
                 "/cancel — отменить ввод сессии\n"
                 "/trial — одноразовый пробный период\n"
                 "/promo CODE — активировать промокод\n"
-                "/ref — реферальная ссылка\n\n"
+                "/ref — реферальная ссылка\n"
+                "/store — публичный каталог модулей\n\n"
                 "Для оплаты цифрового сервиса используется Telegram Stars."
             )
 
@@ -143,7 +157,11 @@ class ControlBot:
             await message.answer(
                 "🎁 <b>Пробный период активирован</b>\n\n"
                 f"Тариф: <b>BASIC</b>\nДо: <code>{_format_timestamp(until)}</code>\n\n"
-                "Теперь можно подключить String Session через /connect."
+                "Готово. Теперь подключи свой Telegram-аккаунт.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔐 Подключить аккаунт", callback_data="home:connect")],
+                    [InlineKeyboardButton(text="🏠 Меню", callback_data="home:menu"), InlineKeyboardButton(text="📊 Статус", callback_data="home:status")],
+                ]),
             )
 
         @r.message(Command("promo"))
@@ -164,7 +182,11 @@ class ControlBot:
             await message.answer(
                 "🎟 <b>Промокод активирован</b>\n\n"
                 f"Тариф: <b>{escape(plan_id.upper())}</b>\n"
-                f"До: <code>{_format_timestamp(until)}</code>"
+                f"До: <code>{_format_timestamp(until)}</code>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📊 Статус", callback_data="home:status"), InlineKeyboardButton(text="🔐 Подключить", callback_data="home:connect")],
+                    [InlineKeyboardButton(text="🏠 Меню", callback_data="home:menu")],
+                ]),
             )
 
         @r.message(Command("ref"))
@@ -186,7 +208,25 @@ class ControlBot:
                 "👥 <b>Реферальная программа</b>\n\n"
                 f"Твой код: <code>{escape(code)}</code>\n"
                 f"Ссылка: <code>{escape(link)}</code>\n\n"
-                f"Бонус владельцу: <b>{self.config.referral_bonus_days} дней</b> после первой успешной оплаты приглашённого."
+                f"Бонус владельцу: <b>{self.config.referral_bonus_days} дней</b> после первой успешной оплаты приглашённого.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Тарифы", callback_data="home:plans"), InlineKeyboardButton(text="🏠 Меню", callback_data="home:menu")],
+                ]),
+            )
+
+        @r.message(Command("store"))
+        async def store_command(message: Message) -> None:
+            base = str(self.config.public_base_url or "").rstrip("/")
+            if not base:
+                await message.answer("📦 Store временно недоступен: публичный URL сервиса не определён.")
+                return
+            await message.answer(
+                "📦 <b>Nexus Module Store</b>\n\n"
+                "Каталог опубликованных модулей и их описаний.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🌐 Открыть Store", url=base + "/store")],
+                    [InlineKeyboardButton(text="💎 Тарифы", callback_data="home:plans"), InlineKeyboardButton(text="🏠 Меню", callback_data="home:menu")],
+                ]),
             )
 
         @r.message(Command("connect"))
@@ -221,9 +261,10 @@ class ControlBot:
                 "📱 <b>Вход по номеру телефона</b>\n\n"
                 "Открой страницу ниже, введи свой номер, код из Telegram и при необходимости пароль 2FA.\n\n"
                 "Код и пароль не записываются в базу. Ссылка одноразовая и живёт 15 минут.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="📱 Открыть безопасный вход", url=url),
-                ]]),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📱 Открыть безопасный вход", url=url)],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="home:menu")],
+                ]),
             )
 
         @r.message(Command("cancel"))
@@ -280,7 +321,8 @@ class ControlBot:
         @r.message(Command("modules"))
         async def modules_command(message: Message) -> None:
             user = await self.manager.register(message.from_user)
-            await message.answer(self._modules_text(user))
+            text, keyboard = await self._modules_panel(message.from_user.id, 0)
+            await message.answer(text, reply_markup=keyboard)
 
         @r.message(Command("module"))
         async def module_command(message: Message) -> None:
@@ -534,6 +576,7 @@ class ControlBot:
                 callback.from_user.id,
                 "🔐 <b>String Session</b>\n\n"
                 "Отправь следующим сообщением только строку сессии. Сообщение будет удалено после получения.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="home:menu")]]),
             )
 
         @r.callback_query(F.data.startswith("home:"))
@@ -550,17 +593,119 @@ class ControlBot:
                 await self._send_plans(callback.message or await self.bot.send_message(callback.from_user.id, "/plans"))
                 return
             if action == "status":
-                target = callback.message if callback.message and int(callback.message.chat.id) == int(callback.from_user.id) else None
-                if target is not None:
-                    await target.answer(self._user_status_text(user))
+                if callback.message and int(callback.message.chat.id) == int(callback.from_user.id):
+                    await callback.message.edit_text(
+                        "📊 <b>Статус аккаунта</b>\n\n" + self._user_status_text(user),
+                        reply_markup=self._home_keyboard(),
+                    )
                 else:
-                    await self.bot.send_message(callback.from_user.id, self._user_status_text(user))
+                    await self.bot.send_message(callback.from_user.id, "📊 <b>Статус аккаунта</b>\n\n" + self._user_status_text(user), reply_markup=self._home_keyboard())
                 return
             if action == "modules":
                 if callback.message and int(callback.message.chat.id) == int(callback.from_user.id):
                     await callback.message.answer(self._modules_text(user))
                 else:
                     await self.bot.send_message(callback.from_user.id, self._modules_text(user))
+                return
+            if action == "trial":
+                try:
+                    until = await self.manager.start_trial(callback.from_user.id)
+                    await callback.message.edit_text(
+                        "🎁 <b>Пробный период активирован</b>\n\n"
+                        f"Тариф: <b>BASIC</b>\nДо: <code>{_format_timestamp(until)}</code>",
+                        reply_markup=self._home_keyboard(),
+                    ) if callback.message else await self.bot.send_message(callback.from_user.id, "🎁 Trial активирован")
+                except Exception as exc:
+                    await callback.answer(str(exc)[:180], show_alert=True)
+                return
+            if action == "ref":
+                meta = await self.manager.db.ensure_account_meta(callback.from_user.id)
+                me = await self.bot.get_me()
+                code = str(meta.get("referral_code") or "")
+                link = f"https://t.me/{me.username}?start={code}" if me.username and code else code
+                await self.bot.send_message(
+                    callback.from_user.id,
+                    "👥 <b>Реферальная программа</b>\n\n"
+                    f"Ссылка: <code>{escape(link)}</code>\n"
+                    f"Бонус: <b>{self.config.referral_bonus_days} дней</b> после первой оплаты приглашённого.",
+                )
+                return
+            if action == "support":
+                support = self.config.support_username or "владельцу сервиса"
+                await self.bot.send_message(callback.from_user.id, f"🆘 <b>Поддержка</b>\n\nОбратись к {escape(support)}.")
+                return
+            if action == "disconnect":
+                try:
+                    await self.manager.disconnect_session(callback.from_user.id)
+                    await self.bot.send_message(callback.from_user.id, "✅ Сессия удалена, worker остановлен.")
+                except Exception as exc:
+                    await callback.answer(str(exc)[:180], show_alert=True)
+                return
+            if action == "menu":
+                user = await self.manager.register(callback.from_user)
+                if callback.message:
+                    await callback.message.edit_text(self._user_home(user), reply_markup=self._home_keyboard())
+                return
+            if action == "modules":
+                text, keyboard = await self._modules_panel(callback.from_user.id, 0)
+                if callback.message:
+                    await callback.message.edit_text(text, reply_markup=keyboard)
+                else:
+                    await self.bot.send_message(callback.from_user.id, text, reply_markup=keyboard)
+                return
+            if action.startswith("mods:"):
+                try:
+                    page = max(0, int(action.split(":", 1)[1]))
+                except ValueError:
+                    page = 0
+                text, keyboard = await self._modules_panel(callback.from_user.id, page)
+                if callback.message:
+                    await callback.message.edit_text(text, reply_markup=keyboard)
+                return
+            if action.startswith("mtoggle:"):
+                parts = action.split(":", 2)
+                name = parts[1].lower() if len(parts) > 1 else ""
+                try:
+                    page = max(0, int(parts[2])) if len(parts) > 2 else 0
+                except ValueError:
+                    page = 0
+                user_now = await self.manager.db.get_user(callback.from_user.id) or user
+                plan_now = self.plans.get(str(user_now.get("plan") or "").lower())
+                if plan_now is None or name not in set(plan_now.modules):
+                    await callback.answer("Модуль недоступен для тарифа.", show_alert=True)
+                    return
+                enabled = self._enabled(user_now)
+                if name == "help" and name in enabled:
+                    await callback.answer("help нельзя отключить.", show_alert=True)
+                    return
+                if name in enabled:
+                    enabled = [x for x in enabled if x != name]
+                else:
+                    enabled.append(name)
+                try:
+                    await self.manager.set_modules(callback.from_user.id, enabled)
+                except Exception as exc:
+                    await callback.answer(str(exc)[:180], show_alert=True)
+                    return
+                text, keyboard = await self._modules_panel(callback.from_user.id, page)
+                if callback.message:
+                    await callback.message.edit_text(text, reply_markup=keyboard)
+                await callback.answer("Готово")
+                return
+            if action == "store":
+                base = str(self.config.public_base_url or "").rstrip("/")
+                if callback.message and base:
+                    await callback.message.edit_text(
+                        "📦 <b>Nexus Module Store</b>\n\nОткрой публичный каталог модулей.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🌐 Открыть Store", url=base + "/store")],
+                            [InlineKeyboardButton(text="🏠 Меню", callback_data="home:menu")],
+                        ]),
+                    )
+                elif base:
+                    await self.bot.send_message(callback.from_user.id, "📦 " + base + "/store")
+                else:
+                    await callback.answer("Публичный Store URL пока недоступен.", show_alert=True)
                 return
             if action == "connect":
                 if not await self._ensure_active_for_user(callback.from_user.id):
@@ -612,6 +757,70 @@ class ControlBot:
                     reply_markup=self._admin_panel_keyboard(),
                 )
 
+        @r.callback_query(F.data == "adm:revenue")
+        async def admin_revenue_callback(callback: CallbackQuery) -> None:
+            if not self.is_owner(callback.from_user.id):
+                await callback.answer("Доступ запрещён.", show_alert=True)
+                return
+            users = await self.manager.db.list_users(10000)
+            sales = await self.manager.db.sales_summary()
+            now = time.time()
+            active = sum(float(u.get("subscription_until") or 0) > now for u in users)
+            workers = sum(1 for p in self.manager.processes.values() if p.is_alive())
+            await callback.answer()
+            if callback.message:
+                await callback.message.edit_text(
+                    "📈 <b>Revenue</b>\n\n"
+                    f"Users: <b>{len(users)}</b>\n"
+                    f"Active subscriptions: <b>{active}</b>\n"
+                    f"Workers: <b>{workers}/{self.config.max_workers}</b>\n"
+                    f"Paid orders: <b>{sales['paid_orders']}</b>\n"
+                    f"Revenue: <b>{sales['paid_stars']} ⭐</b>\n"
+                    f"Refunded: <b>{sales['refunded_stars']} ⭐</b>",
+                    reply_markup=self._admin_panel_keyboard(),
+                )
+
+        @r.callback_query(F.data == "adm:queue")
+        async def admin_queue_callback(callback: CallbackQuery) -> None:
+            if not self.is_owner(callback.from_user.id):
+                await callback.answer("Доступ запрещён.", show_alert=True)
+                return
+            users = await self.manager.db.active_users(time.time())
+            live = {uid for uid, proc in self.manager.processes.items() if proc.is_alive()}
+            queued = [int(row["user_id"]) for row in users if int(row["user_id"]) not in live]
+            blocked = [uid for uid in queued if uid in self.manager.worker_blocked]
+            lines = [
+                "📋 <b>Worker Queue</b>", "",
+                f"Online: <b>{len(live)}/{self.config.max_workers}</b>",
+                f"Queued: <b>{max(0, len(queued)-len(blocked))}</b>",
+                f"Blocked: <b>{len(blocked)}</b>", "",
+            ]
+            lines.extend(f"• <code>{uid}</code> · {'blocked' if uid in blocked else 'queued'}" for uid in queued[:30])
+            await callback.answer()
+            if callback.message:
+                await callback.message.edit_text("\n".join(lines)[:3900], reply_markup=self._admin_panel_keyboard())
+
+        @r.callback_query(F.data == "adm:workers")
+        async def admin_workers_callback(callback: CallbackQuery) -> None:
+            if not self.is_owner(callback.from_user.id):
+                await callback.answer("Доступ запрещён.", show_alert=True)
+                return
+            users = await self.manager.db.list_users(10000)
+            now = time.time()
+            active = sum(float(u.get("subscription_until") or 0) > now for u in users)
+            live = sum(1 for proc in self.manager.processes.values() if proc.is_alive())
+            await callback.answer()
+            if callback.message:
+                await callback.message.edit_text(
+                    "🖥 <b>Workers</b>\n\n"
+                    f"Live: <b>{live}/{self.config.max_workers}</b>\n"
+                    f"Active subscriptions: <b>{active}</b>\n"
+                    f"Starts: <b>{self.manager.worker_starts}</b>\n"
+                    f"Capacity hits: <b>{self.manager.worker_queue_hits}</b>\n"
+                    f"Blocked: <b>{len(self.manager.worker_blocked)}</b>",
+                    reply_markup=self._admin_panel_keyboard(),
+                )
+
         @r.callback_query(F.data.startswith("adm:users:"))
         async def admin_users_callback(callback: CallbackQuery) -> None:
             if not self.is_owner(callback.from_user.id):
@@ -652,12 +861,29 @@ class ControlBot:
                     elif action == "revoke":
                         await self.manager.revoke(user_id)
                         notice = "Подписка отозвана."
+                    elif action == "plus7":
+                        plan = str(user.get("plan") or "pro").lower()
+                        if plan not in self.plans:
+                            plan = "pro"
+                        await self.manager.apply_plan(user_id, plan, days=7)
+                        notice = "Добавлено 7 дней."
                     elif action == "plus30":
                         plan = str(user.get("plan") or "pro").lower()
                         if plan not in self.plans:
                             plan = "pro"
                         await self.manager.apply_plan(user_id, plan, days=30)
                         notice = "Добавлено 30 дней."
+                    elif action in {"basic", "pro", "premium"}:
+                        plan = self.plans.get(action)
+                        if plan is None:
+                            raise ValueError("Тариф не найден")
+                        await self.manager.apply_plan(user_id, plan.id, days=plan.days)
+                        notice = f"Выдан тариф {plan.title} на {plan.days} дней."
+                    elif action == "unblock":
+                        self.manager.worker_blocked.discard(user_id)
+                        self.manager.worker_failures.pop(user_id, None)
+                        await self.manager.start_worker(user_id)
+                        notice = "Worker разблокирован."
                     else:
                         notice = "Неизвестное действие."
                     user = await self.manager.db.get_user(user_id) or user
@@ -696,6 +922,239 @@ class ControlBot:
                     ),
                 )
 
+        async def _download_document(message: Message) -> tuple[str, bytes]:
+            document = getattr(message, "document", None) or getattr(getattr(message, "reply_to_message", None), "document", None)
+            if document is None:
+                raise ValueError("Отправь .py документ с caption /store_publish или ответь командой на документ.")
+            filename = str(getattr(document, "file_name", "module.py") or "module.py")
+            if not filename.lower().endswith(".py"):
+                raise ValueError("В Store принимаются только .py файлы.")
+            if int(getattr(document, "file_size", 0) or 0) > 2 * 1024 * 1024:
+                raise ValueError("Модуль превышает лимит 2 MiB.")
+            tg_file = await self.bot.get_file(document.file_id)
+            if not tg_file or not tg_file.file_path:
+                raise ValueError("Telegram не вернул путь к файлу.")
+            buffer = io.BytesIO()
+            await self.bot.download_file(tg_file.file_path, destination=buffer)
+            return filename, buffer.getvalue()
+
+        def _store_publish_spec(message: Message) -> tuple[dict[str, str], str]:
+            text = (message.text or message.caption or "").strip()
+            match = re.match(r"^/store_publish(?:@[A-Za-z0-9_]+)?(?:\s+|$)(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
+            rest = match.group(1).strip() if match else ""
+            parts = rest.split("::", 1)
+            left = parts[0].strip()
+            changelog = parts[1].strip() if len(parts) > 1 else "Опубликовано через Control Bot."
+            result: dict[str, str] = {}
+            positional: list[str] = []
+            for token in left.split():
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    result[key.strip().lower()] = value.strip()
+                else:
+                    positional.append(token)
+            keys = ("name", "version", "category", "min_plan", "tags")
+            for key, value in zip(keys, positional):
+                result.setdefault(key, value)
+            return result, changelog
+
+        async def _publish_store_document(message: Message) -> None:
+            if not self.is_owner(message.from_user.id):
+                return
+            try:
+                filename, source = await _download_document(message)
+                overrides, changelog = _store_publish_spec(message)
+                requested_name = overrides.get("name") or filename.rsplit(".", 1)[0]
+                analysis = analyze_source(source, filename, requested_name=requested_name)
+                if analysis.name in self.manager.all_builtin_modules():
+                    raise ValueError(f"Имя {analysis.name} зарезервировано встроенным модулем.")
+                min_plan = str(overrides.get("min_plan") or "basic").lower()
+                if min_plan not in {"basic", "pro", "premium"}:
+                    raise ValueError("min_plan должен быть basic, pro или premium.")
+                version = str(overrides.get("version") or analysis.version).strip()[:64]
+                category = str(overrides.get("category") or analysis.category).strip()[:64]
+                raw_tags = overrides.get("tags")
+                tags = [x.strip().lower() for x in str(raw_tags).split(",") if x.strip()][:12] if raw_tags else list(analysis.tags)[:12]
+                authors = list(analysis.authors)
+                if analysis.blocked:
+                    await message.answer(
+                        "⛔ <b>Модуль заблокирован scanner'ом</b>\n\n" + scan_text_for_display(analysis),
+                    )
+                    return
+                row = await self.manager.db.publish_store_module(
+                    analysis.name, version, str(overrides.get("description") or analysis.description),
+                    category, authors, min_plan, tags, source, analysis.sha256, analysis.size,
+                    changelog[:2000], int(message.from_user.id),
+                )
+                await message.answer(
+                    "✅ <b>Модуль опубликован</b>\n\n"
+                    f"Имя: <code>{escape(analysis.name)}</code>\n"
+                    f"Версия: <code>{escape(version)}</code>\n"
+                    f"Категория: <code>{escape(category)}</code>\n"
+                    f"Тариф: <code>{escape(min_plan)}</code>\n"
+                    f"Размер: <code>{analysis.size}</code> bytes\n"
+                    f"SHA-256: <code>{analysis.sha256}</code>\n\n"
+                    f"{scan_text_for_display(analysis)}\n\n"
+                    "⚠️ Исходник опубликован публично и будет доступен пользователям через Store.\n"
+                    "Теперь модуль доступен в <code>.store</code> после обновления каталога.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📦 Открыть модуль", callback_data=f"adm:store:open:{analysis.name}")],
+                        *([[InlineKeyboardButton(text="🌐 Web Store", url=str(self.config.public_base_url).rstrip("/") + "/store")]] if self.config.public_base_url else []),
+                        [InlineKeyboardButton(text="📤 Опубликовать ещё", callback_data="adm:store:help"), InlineKeyboardButton(text="🛠 Панель", callback_data="adm:h")],
+                    ]),
+                )
+            except Exception as exc:
+                await message.answer(f"❌ <b>Store Publish</b>\n<code>{escape(type(exc).__name__)}: {escape(str(exc))}</code>")
+
+        @r.message(Command("store_publish"))
+        async def store_publish_command(message: Message) -> None:
+            # The command must be a reply to a .py document.
+            if not getattr(message, "reply_to_message", None):
+                await message.answer(
+                    "📦 <b>Публикация модуля</b>\n\n"
+                    "Отправь .py документ, затем ответь на него:\n"
+                    "<code>/store_publish</code>\n\n"
+                    "Дополнительно:\n"
+                    "<code>/store_publish name=weather version=1.2.0 category=Tools min_plan=pro tags=api,weather :: New API</code>"
+                )
+                return
+            await _publish_store_document(message)
+
+        @r.message(F.document)
+        async def store_publish_caption(message: Message) -> None:
+            if not self.is_owner(message.from_user.id):
+                return
+            caption = (message.caption or "").strip()
+            if not caption.lower().startswith("/store_publish"):
+                return
+            await _publish_store_document(message)
+
+        @r.message(Command("store_modules"))
+        async def store_modules_command(message: Message) -> None:
+            if not self.is_owner(message.from_user.id):
+                return
+            parts=(message.text or "").split()
+            page=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else 1
+            status=parts[2].lower() if len(parts)>2 else "all"
+            await self._send_admin_store_page(message, page, status=status)
+
+        @r.message(Command("store_stats"))
+        async def store_stats_command(message: Message) -> None:
+            if not self.is_owner(message.from_user.id):
+                return
+            stats=await self.manager.db.store_stats()
+            await message.answer(
+                "📦 <b>Store Stats</b>\n\n"
+                f"Published: <b>{stats['published']}</b>\n"
+                f"Unpublished: <b>{stats['unpublished']}</b>\n"
+                f"Featured: <b>{stats['featured']}</b>\n"
+                f"Downloads: <b>{stats['downloads']}</b>"
+            )
+
+        @r.message(Command("store_unpublish"))
+        async def store_unpublish_command(message: Message) -> None:
+            if not self.is_owner(message.from_user.id): return
+            parts=(message.text or "").split()
+            if len(parts)<2: await message.answer("Использование: <code>/store_unpublish name</code>"); return
+            ok=await self.manager.db.set_store_status(parts[1], "unpublished")
+            await message.answer("✅ Снято с публикации." if ok else "❌ Модуль не найден.")
+
+        @r.message(Command("store_feature"))
+        async def store_feature_command(message: Message) -> None:
+            if not self.is_owner(message.from_user.id): return
+            parts=(message.text or "").split()
+            if len(parts)<3 or parts[2].lower() not in {"on","off","1","0"}:
+                await message.answer("Использование: <code>/store_feature name on|off</code>"); return
+            ok=await self.manager.db.set_store_featured(parts[1], parts[2].lower() in {"on","1"})
+            await message.answer("✅ Обновлено." if ok else "❌ Модуль не найден.")
+
+        @r.message(Command("store_delete"))
+        async def store_delete_command(message: Message) -> None:
+            if not self.is_owner(message.from_user.id): return
+            parts=(message.text or "").split()
+            if len(parts)<2: await message.answer("Использование: <code>/store_delete name</code>"); return
+            ok=await self.manager.db.delete_store_module(parts[1])
+            await message.answer("✅ Удалено из Store вместе с release history." if ok else "❌ Модуль не найден.")
+
+        @r.callback_query(F.data.startswith("adm:store:"))
+        async def admin_store_callback(callback: CallbackQuery) -> None:
+            if not self.is_owner(callback.from_user.id):
+                await callback.answer("Доступ запрещён.", show_alert=True); return
+            parts=str(callback.data).split(":")
+            try:
+                action=parts[2] if len(parts)>2 else "list"
+                if action == "noop":
+                    await callback.answer(); return
+                if action == "list":
+                    page=int(parts[3]) if len(parts)>3 else 1
+                    status=parts[4] if len(parts)>4 else "all"
+                    await self._edit_admin_store_page(callback, page, status=status)
+                    await callback.answer(); return
+                if action == "open":
+                    name=parts[3]
+                    await self._edit_admin_store_module(callback, name)
+                    await callback.answer(); return
+                if action == "feature":
+                    name=parts[3]; value=parts[4].lower() in {"on","1"}
+                    await self.manager.db.set_store_featured(name,value)
+                    await self._edit_admin_store_module(callback,name); await callback.answer("Featured обновлён"); return
+                if action == "status":
+                    name=parts[3]; status=parts[4]
+                    await self.manager.db.set_store_status(name,status)
+                    await self._edit_admin_store_module(callback,name); await callback.answer("Статус обновлён"); return
+                if action == "stats":
+                    stats = await self.manager.db.store_stats()
+                    if callback.message:
+                        await callback.message.edit_text(
+                            "📊 <b>Store Stats</b>\n\n"
+                            f"Published: <b>{stats['published']}</b>\n"
+                            f"Unpublished: <b>{stats['unpublished']}</b>\n"
+                            f"Featured: <b>{stats['featured']}</b>\n"
+                            f"Downloads: <b>{stats['downloads']}</b>",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Store", callback_data="adm:store:list:1")]])
+                        )
+                    await callback.answer(); return
+                if action == "deleteconfirm":
+                    name=parts[3]
+                    if callback.message:
+                        await callback.message.edit_text(
+                            f"⚠️ <b>Удалить {escape(name)} из Store?</b>\nЭто удалит текущую версию, release history и рейтинги.",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"adm:store:delete:{name}"), InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:store:open:{name}")]
+                            ])
+                        )
+                    await callback.answer(); return
+                if action == "delete":
+                    name=parts[3]
+                    ok=await self.manager.db.delete_store_module(name)
+                    await callback.answer("Удалено" if ok else "Не найдено", show_alert=True)
+                    await self._send_admin_store_page(callback.message,1,edit=True) if callback.message else None
+                    return
+                if action == "help":
+                    if callback.message:
+                        base = str(self.config.public_base_url or "").rstrip("/")
+                        buttons = [
+                            [InlineKeyboardButton(text="📤 Куда загружать", callback_data="adm:store:list:1:all")],
+                        ]
+                        if base:
+                            buttons.append([InlineKeyboardButton(text="🌐 Открыть Web Store", url=base + "/store")])
+                        buttons.append([InlineKeyboardButton(text="🏠 Панель", callback_data="adm:h")])
+                        await callback.message.edit_text(
+                            "📤 <b>Публикация модуля в Store</b>\n\n"
+                            "1. Отправь сюда <code>.py</code> документ.\n"
+                            "2. Ответь на него: <code>/store_publish</code>.\n\n"
+                            "Или отправь сам документ с caption вида:\n"
+                            "<code>/store_publish name=weather version=1.2.0 category=Tools min_plan=pro tags=api,weather :: New API</code>\n\n"
+                            "Перед публикацией выполняется syntax/AST security scan. Критические находки блокируются.\n"
+                            "После публикации модуль появляется в пользовательском <code>.store</code>.",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                        )
+                    await callback.answer()
+                    return
+                await callback.answer("Неизвестное действие", show_alert=True)
+            except Exception as exc:
+                await callback.answer(f"Ошибка: {str(exc)[:150]}", show_alert=True)
+
         # Admin area
         @r.message(Command("admin"))
         async def admin_command(message: Message) -> None:
@@ -716,7 +1175,13 @@ class ControlBot:
                 "/panel — интерактивная админ-панель\n"
                 "/queue — очередь workers\n"
                 "/revenue — продажи и возвраты\n"
-                "/promos"
+                "/promos\n"
+                "/store_publish — ответом на .py опубликовать модуль\n"
+                "/store_modules [page] [all|published] — каталог Store\n"
+                "/store_stats — статистика Store\n"
+                "/store_unpublish name\n"
+                "/store_feature name on|off\n"
+                "/store_delete name\n"
             )
 
         @r.message(Command("users"))
@@ -920,12 +1385,135 @@ class ControlBot:
                 lines.append(f"<code>{escape(str(row['code']))}</code> — {escape(str(row['plan']))}, {row['days']}d, осталось {row['uses_left']}")
             await message.answer("\n".join(lines)[:3900])
 
+    async def _send_admin_store_page(self, message: Message, page: int = 1, *, status: str = "all", edit: bool = False) -> None:
+        result = await self.manager.db.list_store_modules(page=page, per_page=6, status=status)
+        total = int(result.get("total") or 0)
+        page = int(result.get("page") or 1)
+        per_page = int(result.get("per_page") or 6)
+        pages = max(1, (total + per_page - 1) // per_page)
+        status_label = "Все" if status == "all" else ("Опубликовано" if status == "published" else "Снято")
+        lines = [
+            "📦 <b>Module Store · Admin</b>",
+            f"Режим: <b>{escape(status_label)}</b> · страница <b>{page}/{pages}</b> · всего <b>{total}</b>",
+            "",
+        ]
+        if not result["items"]:
+            lines.append("Store пока пуст.")
+        else:
+            for row in result["items"]:
+                state = "🟢" if str(row.get("status")) == "published" else "⚪"
+                featured = " ⭐" if row.get("featured") else ""
+                lines.append(
+                    f"{state} <b>{escape(str(row.get('module_name')))}</b>"
+                    f" · v{escape(str(row.get('version') or '?'))}{featured}"
+                    f" · {escape(str(row.get('category') or 'General'))}"
+                    f" · ⬇️ {int(row.get('downloads') or 0)}"
+                )
+        buttons: list[list[InlineKeyboardButton]] = []
+        for row in result["items"]:
+            name = str(row["module_name"])
+            buttons.append([
+                InlineKeyboardButton(text=f"📦 {name[:24]}", callback_data=f"adm:store:open:{name}"),
+            ])
+        nav: list[InlineKeyboardButton] = []
+        if page > 1:
+            nav.append(InlineKeyboardButton(text="⏮", callback_data=f"adm:store:list:1:{status}"))
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm:store:list:{page-1}:{status}"))
+        nav.append(InlineKeyboardButton(text=f"{page}/{pages}", callback_data="adm:store:noop"))
+        if page < pages:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"adm:store:list:{page+1}:{status}"))
+            nav.append(InlineKeyboardButton(text="⏭", callback_data=f"adm:store:list:{pages}:{status}"))
+        buttons.append(nav)
+        buttons.append([
+            InlineKeyboardButton(text="📤 Publish", callback_data="adm:store:help"),
+            InlineKeyboardButton(text="📊 Stats", callback_data="adm:store:stats"),
+        ])
+        filters_row = [
+            InlineKeyboardButton(text="✅ Published", callback_data="adm:store:list:1:published"),
+            InlineKeyboardButton(text="⚪ All", callback_data="adm:store:list:1:all"),
+        ]
+        buttons.append(filters_row)
+        base = str(self.config.public_base_url or "").rstrip("/")
+        if base:
+            buttons.append([InlineKeyboardButton(text="🌐 Web Store", url=base + "/store")])
+        buttons.append([InlineKeyboardButton(text="🏠 Панель", callback_data="adm:h")])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        text_value = "\n".join(lines)[:3900]
+        if edit:
+            await message.edit_text(text_value, reply_markup=markup)
+        else:
+            await message.answer(text_value, reply_markup=markup)
+
+    async def _edit_admin_store_page(self, callback: CallbackQuery, page: int = 1, *, status: str = "all") -> None:
+        if callback.message is None:
+            return
+        await self._send_admin_store_page(callback.message, page, status=status, edit=True)
+
+    async def _edit_admin_store_module(self, callback: CallbackQuery, name: str) -> None:
+        if callback.message is None:
+            return
+        row = await self.manager.db.get_store_module(name, include_unpublished=True)
+        if not row:
+            await callback.message.edit_text(
+                "❌ Модуль Store не найден.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Store", callback_data="adm:store:list:1:all")]]),
+            )
+            return
+        authors_raw = row.get("authors") or "[]"
+        tags_raw = row.get("tags") or "[]"
+        try:
+            authors = json.loads(authors_raw) if isinstance(authors_raw, str) else authors_raw
+        except Exception:
+            authors = []
+        try:
+            tags = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
+        except Exception:
+            tags = []
+        releases = await self.manager.db.list_store_releases(name, 8)
+        status = str(row.get("status") or "published")
+        featured = bool(row.get("featured"))
+        release_lines = []
+        for rel in releases[:8]:
+            release_lines.append(f"• v{escape(str(rel.get('version') or '?'))} · {escape(str(rel.get('changelog') or 'Без changelog'))}")
+        lines = [
+            f"📦 <b>{escape(name)}</b>",
+            "",
+            f"Версия: <code>{escape(str(row.get('version') or '?'))}</code>",
+            f"Статус: <b>{'PUBLISHED' if status == 'published' else 'UNPUBLISHED'}</b>",
+            f"Featured: <b>{'yes' if featured else 'no'}</b>",
+            f"Категория: <code>{escape(str(row.get('category') or 'General'))}</code>",
+            f"Тариф: <code>{escape(str(row.get('min_plan') or 'basic').upper())}</code>",
+            f"Авторы: <code>{escape(', '.join(map(str, authors)) or '—')}</code>",
+            f"Теги: <code>{escape(', '.join(map(str, tags)) or '—')}</code>",
+            f"Скачивания: <b>{int(row.get('downloads') or 0)}</b>",
+            f"SHA-256: <code>{escape(str(row.get('sha256') or ''))}</code>",
+            "",
+            escape(str(row.get('description') or 'Без описания.')),
+        ]
+        if release_lines:
+            lines.extend(["", "🧾 <b>Release history</b>", *release_lines])
+        if row.get("changelog"):
+            lines.extend(["", "📝 <b>Current changelog</b>", escape(str(row.get("changelog")))])
+        buttons = [
+            [
+                InlineKeyboardButton(text="⭐ Featured OFF" if featured else "⭐ Featured ON", callback_data=f"adm:store:feature:{name}:{'off' if featured else 'on'}"),
+                InlineKeyboardButton(text="🟢 Unpublish" if status == "published" else "🟢 Publish", callback_data=f"adm:store:status:{name}:{'unpublished' if status == 'published' else 'published'}"),
+            ],
+            [InlineKeyboardButton(text="🗑 Delete", callback_data=f"adm:store:deleteconfirm:{name}")],
+        ]
+        base = str(self.config.public_base_url or "").rstrip("/")
+        if base:
+            buttons.append([InlineKeyboardButton(text="🌐 Open module", url=f"{base}/store/modules/{name}.json")])
+        buttons.append([InlineKeyboardButton(text="◀️ Store", callback_data="adm:store:list:1:all")])
+        await callback.message.edit_text("\n".join(lines)[:4050], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
     async def _admin_panel_text(self) -> str:
         online = sum(1 for proc in self.manager.processes.values() if proc.is_alive())
         users = await self.manager.db.list_users(10000)
         now = time.time()
         active = sum(float(row.get("subscription_until") or 0) > now for row in users)
         queued = max(0, active - online)
+        store = await self.manager.db.store_stats()
         return (
             "🛠 <b>Админ-панель</b>\n\n"
             f"Пользователей: <b>{len(users)}</b>\n"
@@ -933,8 +1521,9 @@ class ControlBot:
             f"Workers: <b>{online}/{self.config.max_workers}</b>\n"
             f"В очереди: <b>{queued}</b>\n"
             f"Запусков workers: <b>{self.manager.worker_starts}</b>\n"
-            f"Отказов из-за лимита: <b>{self.manager.worker_queue_hits}</b>\n\n"
-            "Users откроет список с постраничной навигацией."
+            f"Отказов из-за лимита: <b>{self.manager.worker_queue_hits}</b>\n"
+            f"Store: <b>{store['published']}</b> опубликовано · <b>{store['downloads']}</b> скачиваний\n\n"
+            "Users и Store открываются кнопками с постраничной навигацией."
         )
 
     @staticmethod
@@ -944,6 +1533,14 @@ class ControlBot:
                 [
                     InlineKeyboardButton(text="👥 Users", callback_data="adm:users:0"),
                     InlineKeyboardButton(text="🎟 Promos", callback_data="adm:promos"),
+                ],
+                [
+                    InlineKeyboardButton(text="📈 Revenue", callback_data="adm:revenue"),
+                    InlineKeyboardButton(text="📋 Queue", callback_data="adm:queue"),
+                ],
+                [
+                    InlineKeyboardButton(text="🖥 Workers", callback_data="adm:workers"),
+                    InlineKeyboardButton(text="📦 Store", callback_data="adm:store:list:1"),
                 ],
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:h")],
             ]
@@ -958,7 +1555,15 @@ class ControlBot:
                     InlineKeyboardButton(text="⏹ Stop", callback_data=f"adm:u:{user_id}:stop"),
                 ],
                 [
+                    InlineKeyboardButton(text="🎁 +7d", callback_data=f"adm:u:{user_id}:plus7"),
                     InlineKeyboardButton(text="🎁 +30d", callback_data=f"adm:u:{user_id}:plus30"),
+                ],
+                [
+                    InlineKeyboardButton(text="💎 PRO", callback_data=f"adm:u:{user_id}:pro"),
+                    InlineKeyboardButton(text="👑 PREMIUM", callback_data=f"adm:u:{user_id}:premium"),
+                ],
+                [
+                    InlineKeyboardButton(text="🧯 Unblock", callback_data=f"adm:u:{user_id}:unblock"),
                     InlineKeyboardButton(text="🚫 Revoke", callback_data=f"adm:u:{user_id}:revoke"),
                 ],
                 [InlineKeyboardButton(text="◀️ Users", callback_data="adm:users:0")],
@@ -1008,6 +1613,7 @@ class ControlBot:
         rows = [
             [InlineKeyboardButton(text="📱 Номер телефона", callback_data="connect:phone")],
             [InlineKeyboardButton(text="🔑 String Session", callback_data="connect:string")],
+            [InlineKeyboardButton(text="🏠 Назад в меню", callback_data="home:menu")],
         ]
         await self.bot.send_message(
             chat_id=int(user_id),
@@ -1048,13 +1654,14 @@ class ControlBot:
 
     async def _send_status(self, message: Message) -> None:
         user = await self.manager.register(message.from_user)
-        await message.answer(self._user_status_text(user))
+        await message.answer(self._user_status_text(user), reply_markup=self._home_keyboard())
 
     def _user_home(self, user: dict[str, Any]) -> str:
         return (
             "🤖 <b>Personal Userbot Service</b>\n\n"
             f"{self._user_status_text(user)}\n\n"
-            "Выбери действие кнопкой ниже или используй /help."
+            "Управляй подпиской и аккаунтом кнопками ниже.\n"
+            "После подключения твой персональный userbot запускается автоматически."
         )
 
     def _user_status_text(self, user: dict[str, Any]) -> str:
@@ -1096,6 +1703,40 @@ class ControlBot:
             return []
         return [str(x).lower() for x in values] if isinstance(values, list) else []
 
+    async def _modules_panel(self, user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        user = await self.manager.db.get_user(int(user_id)) or {}
+        plan = self.plans.get(str(user.get("plan") or "").lower())
+        allowed = sorted(set(plan.modules if plan else ()))
+        custom = sorted(set(await self.manager.db.list_custom_module_names(int(user_id))))
+        names = sorted(set(allowed) | set(custom))
+        enabled = set(self._enabled(user))
+        per_page = 7
+        pages = max(1, (len(names) + per_page - 1) // per_page)
+        page = min(max(0, int(page)), pages - 1)
+        chunk = names[page * per_page:(page + 1) * per_page]
+        lines = [
+            "🧩 <b>Управление модулями</b>",
+            f"Тариф: <b>{escape(str(user.get('plan') or 'none').upper())}</b>",
+            f"Страница <b>{page + 1}/{pages}</b>", "",
+        ]
+        buttons: list[list[InlineKeyboardButton]] = []
+        for name in chunk:
+            state = "✅" if name in enabled else "○"
+            lines.append(f"{state} <code>{escape(name)}</code>")
+            buttons.append([InlineKeyboardButton(
+                f"{'⏹' if name in enabled else '▶️'} {name[:24]}",
+                callback_data=f"home:mtoggle:{name[:28]}:{page}",
+            )])
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"home:mods:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="home:modules" if pages == 1 else f"home:mods:{page}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"home:mods:{page + 1}"))
+        buttons.append(nav)
+        buttons.append([InlineKeyboardButton("🏠 Меню", callback_data="home:menu")])
+        return "\n".join(lines)[:3900], InlineKeyboardMarkup(inline_keyboard=buttons)
+
     def _admin_user_text(self, user: dict[str, Any]) -> str:
         uid = int(user["user_id"])
         until = float(user.get("subscription_until") or 0)
@@ -1122,6 +1763,16 @@ class ControlBot:
                     InlineKeyboardButton(text="🧩 Модули", callback_data="home:modules"),
                     InlineKeyboardButton(text="🔐 Подключить", callback_data="home:connect"),
                 ],
+                [InlineKeyboardButton(text="📦 Module Store", callback_data="home:store")],
+                [
+                    InlineKeyboardButton(text="🎁 Trial", callback_data="home:trial"),
+                    InlineKeyboardButton(text="👥 Реферал", callback_data="home:ref"),
+                ],
+                [
+                    InlineKeyboardButton(text="🆘 Поддержка", callback_data="home:support"),
+                    InlineKeyboardButton(text="🔄 Обновить", callback_data="home:menu"),
+                ],
+                [InlineKeyboardButton(text="🗑 Отключить аккаунт", callback_data="home:disconnect")],
             ]
         )
 

@@ -33,7 +33,7 @@ class TenantManager:
     CORE_BUILTINS = {
         "ping", "help", "profile", "manager", "framework", "automation", "prefixes",
         "inline", "universal", "subscription", "security", "blacklist", "system",
-        "loader", "backup", "store", "eval", "notes", "bookmarks",
+        "loader", "backup", "store", "eval", "quickpanel", "notes", "bookmarks",
         "chatstats", "chattools", "chatinfo", "search", "activity", "doctor", "macros", "presets", "watchdog",
         "snippets", "media", "triggers", "scheduler", "exporter", "sudo", "dialogs", "mentions", "texttools", "devtools", "grep", "quiet", "variables", "logs", "scanner", "download", "chatrules",
     }

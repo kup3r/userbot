@@ -121,6 +121,54 @@ CREATE TABLE IF NOT EXISTS tenant_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_tenant_audit_lookup
     ON tenant_audit(tenant_id, created_at DESC);
+
+
+CREATE TABLE IF NOT EXISTS store_modules (
+    module_name TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'General',
+    authors TEXT NOT NULL DEFAULT '[]',
+    min_plan TEXT NOT NULL DEFAULT 'basic',
+    tags TEXT NOT NULL DEFAULT '[]',
+    source BYTEA NOT NULL,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    downloads BIGINT NOT NULL DEFAULT 0,
+    featured INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'published',
+    changelog TEXT NOT NULL DEFAULT '',
+    published_by BIGINT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_store_modules_browse
+    ON store_modules(status, featured DESC, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS store_releases (
+    id BIGSERIAL PRIMARY KEY,
+    module_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    source BYTEA NOT NULL,
+    sha256 TEXT NOT NULL,
+    changelog TEXT NOT NULL DEFAULT '',
+    published_by BIGINT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    UNIQUE(module_name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_store_releases_lookup
+    ON store_releases(module_name, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS store_ratings (
+    module_name TEXT NOT NULL,
+    user_id BIGINT NOT NULL,
+    rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY(module_name, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_store_ratings_module
+    ON store_ratings(module_name);
 """
 
 
@@ -208,6 +256,45 @@ CREATE TABLE IF NOT EXISTS tenant_audit (
     event TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS store_modules (
+    module_name TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'General',
+    authors TEXT NOT NULL DEFAULT '[]',
+    min_plan TEXT NOT NULL DEFAULT 'basic',
+    tags TEXT NOT NULL DEFAULT '[]',
+    source BLOB NOT NULL,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    downloads INTEGER NOT NULL DEFAULT 0,
+    featured INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'published',
+    changelog TEXT NOT NULL DEFAULT '',
+    published_by INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS store_releases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    source BLOB NOT NULL,
+    sha256 TEXT NOT NULL,
+    changelog TEXT NOT NULL DEFAULT '',
+    published_by INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(module_name, version)
+);
+CREATE TABLE IF NOT EXISTS store_ratings (
+    module_name TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    rating INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(module_name, user_id)
 );
 """
 
@@ -686,6 +773,217 @@ class Database:
         )
         await db.commit()
         return cur.rowcount == 1
+
+
+    async def publish_store_module(
+        self,
+        name: str,
+        version: str,
+        description: str,
+        category: str,
+        authors: list[str] | tuple[str, ...],
+        min_plan: str,
+        tags: list[str] | tuple[str, ...],
+        source: bytes,
+        sha256: str,
+        size: int,
+        changelog: str,
+        published_by: int,
+    ) -> dict[str, Any]:
+        name = str(name).strip().lower()
+        authors_json = json.dumps([str(x) for x in authors], ensure_ascii=False)
+        tags_json = json.dumps([str(x) for x in tags], ensure_ascii=False)
+        now = time.time()
+        previous = await self.get_store_module(name, include_unpublished=True)
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        """INSERT INTO store_modules
+                        (module_name,version,description,category,authors,min_plan,tags,source,sha256,size,downloads,featured,status,changelog,published_by,created_at,updated_at)
+                        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT downloads FROM store_modules WHERE module_name=$1),0),COALESCE((SELECT featured FROM store_modules WHERE module_name=$1),0),'published',$11,$12,COALESCE((SELECT created_at FROM store_modules WHERE module_name=$1),$13),$13)
+                        ON CONFLICT(module_name) DO UPDATE SET
+                          version=EXCLUDED.version, description=EXCLUDED.description, category=EXCLUDED.category,
+                          authors=EXCLUDED.authors, min_plan=EXCLUDED.min_plan, tags=EXCLUDED.tags,
+                          source=EXCLUDED.source, sha256=EXCLUDED.sha256, size=EXCLUDED.size,
+                          status='published', changelog=EXCLUDED.changelog, published_by=EXCLUDED.published_by, updated_at=EXCLUDED.updated_at""",
+                        name, str(version), str(description), str(category), authors_json, str(min_plan), tags_json,
+                        source, str(sha256), int(size), str(changelog), int(published_by), now,
+                    )
+                    await conn.execute(
+                        """INSERT INTO store_releases(module_name,version,source,sha256,changelog,published_by,created_at)
+                           VALUES($1,$2,$3,$4,$5,$6,$7)
+                           ON CONFLICT(module_name,version) DO UPDATE SET source=EXCLUDED.source, sha256=EXCLUDED.sha256, changelog=EXCLUDED.changelog, published_by=EXCLUDED.published_by""",
+                        name, str(version), source, str(sha256), str(changelog), int(published_by), now,
+                    )
+                    row = await conn.fetchrow("SELECT * FROM store_modules WHERE module_name=$1", name)
+            return dict(row) if row else {}
+        db = self._sq()
+        existing_featured = int(previous.get("featured") or 0) if previous else 0
+        existing_downloads = int(previous.get("downloads") or 0) if previous else 0
+        created_at = float(previous.get("created_at") or now) if previous else now
+        await db.execute(
+            """INSERT INTO store_modules
+            (module_name,version,description,category,authors,min_plan,tags,source,sha256,size,downloads,featured,status,changelog,published_by,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(module_name) DO UPDATE SET
+              version=excluded.version, description=excluded.description, category=excluded.category,
+              authors=excluded.authors, min_plan=excluded.min_plan, tags=excluded.tags, source=excluded.source,
+              sha256=excluded.sha256, size=excluded.size, status='published', changelog=excluded.changelog,
+              published_by=excluded.published_by, updated_at=excluded.updated_at""",
+            (name, str(version), str(description), str(category), authors_json, str(min_plan), tags_json,
+             source, str(sha256), int(size), existing_downloads, existing_featured, "published", str(changelog), int(published_by), created_at, now),
+        )
+        await db.execute(
+            """INSERT INTO store_releases(module_name,version,source,sha256,changelog,published_by,created_at)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(module_name,version) DO UPDATE SET source=excluded.source, sha256=excluded.sha256, changelog=excluded.changelog, published_by=excluded.published_by""",
+            (name, str(version), source, str(sha256), str(changelog), int(published_by), now),
+        )
+        await db.commit()
+        return await self.get_store_module(name, include_unpublished=True) or {}
+
+    async def list_store_modules(self, *, page: int = 1, per_page: int = 12, status: str = "published", query: str = "") -> dict[str, Any]:
+        page = max(1, int(page)); per_page = max(1, min(50, int(per_page)))
+        status = str(status or "published").lower()
+        query = str(query or "").strip().lower()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                where: list[str] = []
+                args: list[Any] = []
+                if status != "all":
+                    args.append(status)
+                    where.append("status=$1")
+                if query:
+                    args.append(f"%{query}%")
+                    idx = len(args)
+                    where.append(f"(module_name ILIKE ${idx} OR description ILIKE ${idx} OR category ILIKE ${idx} OR authors ILIKE ${idx} OR tags ILIKE ${idx})")
+                where_sql = " AND ".join(where) or "TRUE"
+                total = int(await conn.fetchval(f"SELECT COUNT(*) FROM store_modules WHERE {where_sql}", *args) or 0)
+                args_page = list(args) + [per_page, (page-1)*per_page]
+                limit_idx = len(args_page) - 1
+                offset_idx = len(args_page)
+                rows = await conn.fetch(
+                    f"SELECT * FROM store_modules WHERE {where_sql} ORDER BY featured DESC, updated_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}",
+                    *args_page,
+                )
+            return {"items": [dict(r) for r in rows], "total": total, "page": page, "per_page": per_page}
+        db = self._sq()
+        clauses: list[str] = []
+        args: list[Any] = []
+        if status != "all":
+            clauses.append("status=?")
+            args.append(status)
+        if query:
+            q = f"%{query}%"; clauses.append("(lower(module_name) LIKE ? OR lower(description) LIKE ? OR lower(category) LIKE ? OR lower(authors) LIKE ? OR lower(tags) LIKE ?)"); args.extend([q]*5)
+        where = " AND ".join(clauses) or "1=1"
+        async with db.execute(f"SELECT COUNT(*) FROM store_modules WHERE {where}", tuple(args)) as cur:
+            total = int((await cur.fetchone())[0])
+        args_page = list(args) + [per_page, (page-1)*per_page]
+        async with db.execute(f"SELECT * FROM store_modules WHERE {where} ORDER BY featured DESC, updated_at DESC LIMIT ? OFFSET ?", tuple(args_page)) as cur:
+            rows = await cur.fetchall()
+        return {"items": [dict(r) for r in rows], "total": total, "page": page, "per_page": per_page}
+
+    async def get_store_module(self, name: str, *, include_unpublished: bool = False) -> dict[str, Any] | None:
+        name = str(name).strip().lower()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM store_modules WHERE module_name=$1", name)
+            result = dict(row) if row else None
+        else:
+            db = self._sq()
+            async with db.execute("SELECT * FROM store_modules WHERE module_name=?", (name,)) as cur:
+                row = await cur.fetchone()
+            result = dict(row) if row else None
+        if result and not include_unpublished and str(result.get("status")) != "published":
+            return None
+        return result
+
+    async def increment_store_download(self, name: str) -> None:
+        name = str(name).strip().lower()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                await conn.execute("UPDATE store_modules SET downloads=downloads+1 WHERE module_name=$1 AND status='published'", name)
+            return
+        db = self._sq(); await db.execute("UPDATE store_modules SET downloads=downloads+1 WHERE module_name=? AND status='published'", (name,)); await db.commit()
+
+    async def set_store_featured(self, name: str, featured: bool) -> bool:
+        name = str(name).strip().lower(); value = int(bool(featured)); now=time.time()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                result = await conn.execute("UPDATE store_modules SET featured=$1, updated_at=$2 WHERE module_name=$3", value, now, name)
+            return str(result).endswith("1")
+        db=self._sq(); cur=await db.execute("UPDATE store_modules SET featured=?, updated_at=? WHERE module_name=?",(value,now,name)); await db.commit(); return cur.rowcount==1
+
+    async def set_store_status(self, name: str, status: str) -> bool:
+        status = "published" if str(status).lower() == "published" else "unpublished"
+        name=str(name).strip().lower(); now=time.time()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                result=await conn.execute("UPDATE store_modules SET status=$1, updated_at=$2 WHERE module_name=$3",status,now,name)
+            return str(result).endswith("1")
+        db=self._sq(); cur=await db.execute("UPDATE store_modules SET status=?, updated_at=? WHERE module_name=?",(status,now,name)); await db.commit(); return cur.rowcount==1
+
+    async def delete_store_module(self, name: str) -> bool:
+        name=str(name).strip().lower()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("DELETE FROM store_releases WHERE module_name=$1", name)
+                    await conn.execute("DELETE FROM store_ratings WHERE module_name=$1", name)
+                    result=await conn.execute("DELETE FROM store_modules WHERE module_name=$1", name)
+            return str(result).endswith("1")
+        db=self._sq(); await db.execute("DELETE FROM store_releases WHERE module_name=?",(name,)); await db.execute("DELETE FROM store_ratings WHERE module_name=?",(name,)); cur=await db.execute("DELETE FROM store_modules WHERE module_name=?",(name,)); await db.commit(); return cur.rowcount==1
+
+    async def list_store_releases(self, name: str, limit: int = 10) -> list[dict[str, Any]]:
+        name=str(name).strip().lower(); limit=max(1,min(50,int(limit)))
+        if self.is_postgres:
+            async with self._pg().acquire() as conn: rows=await conn.fetch("SELECT id,module_name,version,sha256,changelog,published_by,created_at FROM store_releases WHERE module_name=$1 ORDER BY created_at DESC LIMIT $2",name,limit)
+            return [dict(r) for r in rows]
+        db = self._sq()
+        async with db.execute(
+            "SELECT id,module_name,version,sha256,changelog,published_by,created_at FROM store_releases WHERE module_name=? ORDER BY created_at DESC LIMIT ?",
+            (name, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def store_rate(self, name: str, user_id: int, rating: int) -> bool:
+        rating=max(1,min(5,int(rating))); name=str(name).strip().lower(); now=time.time(); uid=int(user_id)
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                await conn.execute("""INSERT INTO store_ratings(module_name,user_id,rating,created_at,updated_at) VALUES($1,$2,$3,$4,$4)
+                    ON CONFLICT(module_name,user_id) DO UPDATE SET rating=EXCLUDED.rating, updated_at=EXCLUDED.updated_at""", name,uid,rating,now)
+            return True
+        db=self._sq(); await db.execute("""INSERT INTO store_ratings(module_name,user_id,rating,created_at,updated_at) VALUES(?,?,?,?,?)
+            ON CONFLICT(module_name,user_id) DO UPDATE SET rating=excluded.rating, updated_at=excluded.updated_at""",(name,uid,rating,now,now)); await db.commit(); return True
+
+    async def store_rating_summary(self, name: str) -> dict[str, Any]:
+        name=str(name).strip().lower()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn: row=await conn.fetchrow("SELECT COUNT(*) AS count, COALESCE(AVG(rating),0) AS avg FROM store_ratings WHERE module_name=$1",name)
+            return {"count":int(row["count"]),"avg":float(row["avg"])} if row else {"count":0,"avg":0.0}
+        db = self._sq()
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(AVG(rating),0) FROM store_ratings WHERE module_name=?",
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+        return {"count": int(row[0]), "avg": float(row[1])}
+
+    async def store_stats(self) -> dict[str, int]:
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                row=await conn.fetchrow("SELECT COUNT(*) FILTER (WHERE status='published') AS published, COUNT(*) FILTER (WHERE status!='published') AS unpublished, COALESCE(SUM(downloads),0) AS downloads, COUNT(*) FILTER (WHERE featured=1 AND status='published') AS featured FROM store_modules")
+            return {k:int(row[k] or 0) for k in ("published","unpublished","downloads","featured")}
+        db = self._sq()
+        async with db.execute(
+            "SELECT COUNT(CASE WHEN status='published' THEN 1 END), "
+            "COUNT(CASE WHEN status!='published' THEN 1 END), COALESCE(SUM(downloads),0), "
+            "COUNT(CASE WHEN featured=1 AND status='published' THEN 1 END) FROM store_modules"
+        ) as cur:
+            row = await cur.fetchone()
+        return {"published": int(row[0]), "unpublished": int(row[1]), "downloads": int(row[2]), "featured": int(row[3])}
 
 
 def decode_modules(value: Any) -> list[str]:

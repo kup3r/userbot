@@ -84,12 +84,12 @@ async def run_worker(payload: dict[str, Any]) -> None:
     catalog_version = int(await storage.get("framework", "catalog_version", 0) or 0)
     if isinstance(stored_enabled, list):
         enabled = stored_enabled
-        # One-time migration for existing tenants: add v12 built-ins without
+        # One-time migration for existing tenants: add v13 built-ins without
         # disturbing modules the user explicitly removed later. Only modules
         # allowed by the current subscription are considered.
-        if catalog_version < 12:
+        if catalog_version < 13:
             additions = [
-                name for name in ("shortcuts", "store")
+                name for name in ("shortcuts", "store", "quickpanel")
                 if name in {str(x).lower() for x in payload.get("allowed_modules", [])}
             ]
             merged = list(dict.fromkeys([str(x).lower() for x in stored_enabled] + additions))
@@ -98,8 +98,8 @@ async def run_worker(payload: dict[str, Any]) -> None:
                 await storage.set("framework", "enabled_modules", merged)
     else:
         enabled = list(enabled) if isinstance(enabled, list) else []
-    if catalog_version < 12:
-        await storage.set("framework", "catalog_version", 12)
+    if catalog_version < 13:
+        await storage.set("framework", "catalog_version", 13)
 
     config = WorkerConfig(
         api_id=int(payload["api_id"]),
@@ -124,7 +124,7 @@ async def run_worker(payload: dict[str, Any]) -> None:
         api_id=config.api_id,
         api_hash=config.api_hash,
         session_string=config.string_session,
-        app_version="NexusUserbot/11.0",
+        app_version="NexusUserbot/13.1",
     )
     loader = ModuleLoader(
         app=app,
