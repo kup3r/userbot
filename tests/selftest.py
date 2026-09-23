@@ -56,13 +56,21 @@ def test_manager_modules() -> None:
         assert f'"{name}"' in source, f"Missing manager builtin module: {name}"
 
 
-def test_inline_is_native() -> None:
-    source = (MODULES / "inline.py").read_text(encoding="utf-8")
-    assert "HelperBotAPI" not in source
-    assert "getUpdates" not in source
-    assert "BOT_TOKEN" not in source
-    assert 'CALLBACK = "ub9:"' in source
-    assert "history" in source and "security" in source
+def test_inline_panel_bridge() -> None:
+    inline = (MODULES / "inline.py").read_text(encoding="utf-8")
+    bridge = (ROOT / "core" / "panel_bridge.py").read_text(encoding="utf-8")
+    control = (ROOT / "service" / "control_bot.py").read_text(encoding="utf-8")
+    panel = (ROOT / "service" / "panel_ui.py").read_text(encoding="utf-8")
+    assert "PanelBridge" in inline
+    assert "send_panel" in inline
+    assert "CONTROL_BOT_TOKEN" in bridge
+    assert "PanelController" in control
+    assert "nxp:" in panel
+    assert "message.edit_text" in panel
+    assert "page:" in panel and "➡️" in panel
+    # The user-account worker must not rely on CallbackQueryHandler for its UI.
+    assert "CallbackQueryHandler" not in inline
+
 
 
 def test_new_features() -> None:
@@ -151,16 +159,19 @@ def test_schema_has_core_tables() -> None:
     conn.close()
 
 
-def test_v12_features() -> None:
+def test_v13_ui_bridge_features() -> None:
     manager = (MODULES / "manager.py").read_text(encoding="utf-8")
-    store = (MODULES / "store.py").read_text(encoding="utf-8")
     inline = (MODULES / "inline.py").read_text(encoding="utf-8")
-    shortcuts = (MODULES / "shortcuts.py").read_text(encoding="utf-8")
+    bridge = (ROOT / "core" / "panel_bridge.py").read_text(encoding="utf-8")
+    panel = (ROOT / "service" / "panel_ui.py").read_text(encoding="utf-8")
+    worker = (ROOT / "service" / "worker.py").read_text(encoding="utf-8")
     assert "PAGE_SIZE = 8" in manager
-    assert "favcmd" in manager and "cmdhub:" in manager
-    assert "_builtin_catalog" in store and "store uninstall" in store
-    assert "_show_commands" in inline and "cmdfav" in inline and "mods_store" in inline
-    assert "class Module(BaseModule)" in shortcuts and "shortcut add" in shortcuts
+    assert "favcmd" in manager and "_send_command_panel" in manager
+    assert "PanelBridge" in manager and "PanelBridge" in inline
+    assert '"cmds"' in panel and '"page:"' in panel
+    assert '"control_bot_token"' in worker
+    assert "token_hex" in bridge
+
 
 
 def test_store_v13_2() -> None:
@@ -180,7 +191,7 @@ def main() -> None:
         test_python_syntax,
         test_command_conflicts,
         test_manager_modules,
-        test_inline_is_native,
+        test_inline_panel_bridge,
         test_new_features,
         test_hikka_style_api,
         test_custom_module_history,
@@ -188,7 +199,7 @@ def main() -> None:
         test_free_render_static_contract,
         test_render_config,
         test_schema_has_core_tables,
-        test_v12_features,
+        test_v13_ui_bridge_features,
         test_store_v13_2,
     ]
     for test in tests:
