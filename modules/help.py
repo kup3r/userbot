@@ -33,11 +33,6 @@ class Module(BaseModule):
         raw = ctx.raw_args.strip()
         modules = [entry for entry in self.loader.list_modules() if not getattr(entry.instance, "hidden", False) and not self.loader.is_module_hidden(entry.module_name)]
         if not raw:
-            # Use the manager command hub when available so `.help` gets the
-            # same compact paginated inline UI as `.cmds`.
-            if self.loader.loaded.get("manager") is not None:
-                await self.invoke("commands", ctx.message)
-                return
             await ctx.message.reply_text(self._module_overview(modules))
             return
 
