@@ -1,0 +1,26 @@
+{
+  "modules": [
+    {
+      "name": "auto_reply",
+      "version": "2.0.0",
+      "author": "Nexus Team",
+      "description": "Автоматические ответы на сообщения по заданным правилам.",
+      "category": "Automation",
+      "direct_url": "https://raw.githubusercontent.com/kup3r/userbot/refs/heads/main/nexus-module-store/modules/auto_reply.py",
+      "sha256": "SHA256_ТУТ"
+    }
+  ]
+}
+{
+  "modules": [
+    {
+      "name": "online",
+      "version": "2.0.0",
+      "author": "Nexus Team",
+      "description": "Показывает находитесь ли вы в сети.",
+      "category": "Automation",
+      "direct_url": "https://raw.githubusercontent.com/kup3r/userbot/refs/heads/main/nexus-module-store/modules/online.py",
+      "sha256": "SHA256_ТУТ"
+    }
+  ]
+}
