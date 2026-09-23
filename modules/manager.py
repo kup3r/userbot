@@ -1,8 +1,7 @@
 """Runtime manager and Hikka-style command hub.
 
 Adds compact paginated command browsing, categories, module filtering, command
-favorites and a native inline command palette without changing the underlying
-loader API.
+favorites and a Control-Bot-backed inline command palette.
 """
 
 from __future__ import annotations
@@ -11,16 +10,17 @@ import asyncio
 import hashlib
 import logging
 import platform
+import secrets
 import time
 from collections import deque
 from html import escape
 from typing import Any
 
-from pyrogram.handlers import CallbackQueryHandler
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.commands import CommandContext, callback, command
 from core.module import BaseModule
+from core.panel_bridge import PanelBridge, PanelBridgeError
 from core.utils import format_uptime
 
 
@@ -42,7 +42,7 @@ class ErrorBufferHandler(logging.Handler):
 class Module(BaseModule):
     name = "Manager"
     description = "Command hub, paginated help, favorites, runtime statistics and error buffer."
-    version = "13.2.0"
+    version = "13.3.0"
     category = "Core"
     NAMESPACE = "manager"
     CMD_CALLBACK = "cmdhub:"
@@ -70,11 +70,7 @@ class Module(BaseModule):
             self._command_favorites = [str(x).lower().lstrip(self.get_prefix()) for x in favorites if str(x).strip()]
         self._log_handler = ErrorBufferHandler(self.error_buffer)
         logging.getLogger().addHandler(self._log_handler)
-        from pyrogram import filters
-        self._cb_handler = self.app.add_handler(
-            CallbackQueryHandler(self._command_callback, filters.regex(r"^cmdhub:")),
-            group=91,
-        )
+        # Interactive command UI is owned by the Control Bot; user accounts do not receive callback updates.
 
     async def on_unload(self) -> None:
         if self._log_handler is not None:
@@ -329,19 +325,81 @@ class Module(BaseModule):
 
     @command("commands", aliases=("cmds", "cmd"), category="Core")
     async def commands(self, ctx: CommandContext) -> None:
-        """Компактный каталог команд: страницы, категории, поиск и избранное."""
+        """Компактный каталог команд с реально работающими inline-кнопками в Control Bot."""
         page, mode, payload = self._parse_cmds_args(ctx.raw_args)
+        await self._send_command_panel(ctx, page, mode, payload)
+
+    async def _send_command_panel(self, ctx: CommandContext, page: int, mode: str, payload: str) -> None:
+        token = secrets.token_hex(6)
         rows = self._rows_for(mode, payload)
-        msg = await ctx.message.reply_text(
-            self._page_text(rows, page, mode=mode, payload=payload, total=len(rows)),
-            reply_markup=self._page_keyboard(rows, page, mode=mode, payload=payload),
-            quote=True,
+        bridge = PanelBridge(
+            getattr(self.loader.config, "control_bot_token", None),
+            self.storage,
+            int(self.loader.tenant_id),
         )
-        self._panel_views[(int(msg.chat.id), int(msg.id))] = (max(1, page), mode, payload)
+        keyboard = self._bridge_keyboard(int(self.loader.tenant_id), token, rows, page, mode, payload)
+        state = {
+            "view": "commands",
+            "mode": mode,
+            "payload": payload,
+            "page": max(1, int(page)),
+            "command_rows": rows,
+            "favorites": list(self._command_favorites),
+            "source_chat_id": int(getattr(getattr(ctx.message, "chat", None), "id", 0) or 0),
+        }
+        try:
+            await bridge.send_panel(
+                kind="commands",
+                state=state,
+                text=self._page_text(rows, page, mode=mode, payload=payload, total=len(rows)),
+                keyboard=keyboard,
+                token=token,
+            )
+            username = await bridge.bot_username()
+            target = f"@{escape(username)}" if username else "Control Bot"
+            await ctx.message.reply_text(
+                f"✅ <b>Панель команд отправлена в {target}</b>\n"
+                f"Там работают кнопки <b>⬅️ / ➡️</b>, категории и избранное.",
+                quote=True,
+            )
+        except PanelBridgeError as exc:
+            await ctx.message.reply_text(
+                f"❌ <b>Не удалось открыть панель команд</b>\n<code>{escape(str(exc)[:900])}</code>",
+                quote=True,
+            )
+
+    @staticmethod
+    def _bridge_keyboard(user_id: int, token: str, rows: list[dict[str, Any]], page: int, mode: str, payload: str) -> list[list[dict[str, Any]]]:
+        # Buttons are rendered by Control Bot, not the user account.
+        page_count = max(1, (len(rows) + 8 - 1) // 8)
+        page = max(1, min(int(page), page_count))
+        def cb(action: str) -> str:
+            return f"nxp:{int(user_id)}:{token}:{action}"[:64]
+        # A button layout is generated from the same snapshot used for the text.
+        batch = rows[(page - 1) * 8:page * 8]
+        buttons: list[list[dict[str, Any]]] = []
+        for idx, row in enumerate(batch):
+            buttons.append([
+                {"text": "." + str(row.get("name")), "callback_data": cb(f"detail:{idx}")},
+                {"text": "☆", "callback_data": cb(f"fav:{idx}")},
+            ])
+        nav = [{"text": "⏮", "callback_data": cb("page:1")}]
+        if page > 1:
+            nav.append({"text": "⬅️", "callback_data": cb(f"page:{page-1}")})
+        nav.append({"text": f"{page}/{page_count}", "callback_data": cb("noop")})
+        if page < page_count:
+            nav.append({"text": "➡️", "callback_data": cb(f"page:{page+1}")})
+        nav.append({"text": "⏭", "callback_data": cb(f"page:{page_count}")})
+        buttons.append(nav)
+        buttons.append([
+            {"text": "📁 Categories", "callback_data": cb("cats")},
+            {"text": "⭐ Favorites", "callback_data": cb("cmdfav")},
+        ])
+        return buttons
 
     @command("favcmd", aliases=("favoritecmd",), category="Core")
     async def favcmd(self, ctx: CommandContext) -> None:
-        """Сохранить любимые команды: add/del/list."""
+        """Добавить/удалить команду из избранного или открыть панель избранного."""
         parts = ctx.raw_args.strip().split(maxsplit=1)
         action = parts[0].lower() if parts else "list"
         value = parts[1].strip().lower().lstrip(self.get_prefix()) if len(parts) > 1 else ""
@@ -367,64 +425,10 @@ class Module(BaseModule):
             else:
                 await ctx.message.reply_text("⭐ Такой команды нет в избранном.", quote=True)
             return
-        favs = set(self._command_favorites)
-        if not favs:
+        if not self._command_favorites:
             await ctx.message.reply_text(f"⭐ Избранное пусто.\nИспользуй <code>{escape(self.get_prefix())}favcmd add ping</code>.", quote=True)
             return
-        rows = self._rows_for("fav", "")
-        await ctx.message.reply_text(
-            self._page_text(rows, 1, mode="fav", payload=""),
-            reply_markup=self._page_keyboard(rows, 1, mode="fav", payload=""),
-            quote=True,
-        )
-
-    async def _command_callback(self, _client: Any, query: CallbackQuery) -> None:
-        actor_id = int(getattr(getattr(query, "from_user", None), "id", 0) or 0)
-        if actor_id != int(getattr(self.loader, "tenant_id", 0) or 0):
-            await query.answer("⛔ Только владельцу.", show_alert=True)
-            return
-        message = query.message
-        if message is None:
-            await query.answer("Сообщение недоступно.", show_alert=True)
-            return
-        data = str(query.data or "")
-        try:
-            if data == self.CMD_CALLBACK + "home":
-                await self._render_page(message, 1, "all", "")
-            elif data == self.CMD_CALLBACK + "favpage":
-                await self._render_page(message, 1, "fav", "")
-            elif data == self.CMD_CALLBACK + "categories":
-                await self._show_categories(message)
-            elif data == self.CMD_CALLBACK + "noop":
-                await query.answer()
-                return
-            elif data == self.CMD_CALLBACK + "back":
-                view = self._panel_views.get((int(message.chat.id), int(message.id)), (1, "all", ""))
-                await self._render_page(message, view[0], view[1], view[2])
-            elif data.startswith(self.CMD_CALLBACK + "detail:"):
-                await self._show_command_detail(message, data.rsplit(":", 1)[1])
-            elif data.startswith(self.CMD_CALLBACK + "fav:"):
-                await self._toggle_favorite_token(message, data.rsplit(":", 1)[1])
-            elif data.startswith(self.CMD_CALLBACK + "cat:"):
-                token = data.rsplit(":", 1)[1]
-                payload = self._category_tokens.get(token)
-                if payload is None:
-                    await query.answer("Категория устарела. Открой .cmds заново.", show_alert=True)
-                    return
-                await self._render_page(message, 1, "category", payload)
-            elif data.startswith(self.CMD_CALLBACK + "page:"):
-                parts = data.split(":", 4)
-                mode = parts[2]
-                page = max(1, int(parts[3]))
-                payload = parts[4] if len(parts) > 4 else ""
-                await self._render_page(message, page, mode, payload)
-            await query.answer()
-        except Exception as exc:
-            self.loader.record_runtime_error(self.name, "command_callback", exc)
-            try:
-                await query.answer(f"Ошибка: {type(exc).__name__}", show_alert=True)
-            except Exception:
-                pass
+        await self._send_command_panel(ctx, 1, "fav", "")
 
     # ------------------------- runtime/error tools -------------------------
     @command("history", aliases=("cmdhistory", "chistory"), category="Core")
