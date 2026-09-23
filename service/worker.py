@@ -37,7 +37,6 @@ class WorkerConfig:
     command_rate_limit: int = 8
     command_rate_window: float = 2.0
     subscription_until: float = 0.0
-    control_bot_token: str | None = None
 
 
 def _logging(tenant_dir: Path, level: str) -> None:
@@ -85,12 +84,12 @@ async def run_worker(payload: dict[str, Any]) -> None:
     catalog_version = int(await storage.get("framework", "catalog_version", 0) or 0)
     if isinstance(stored_enabled, list):
         enabled = stored_enabled
-        # One-time migration for existing tenants: add v13 built-ins without
+        # One-time migration for existing tenants: add v12 built-ins without
         # disturbing modules the user explicitly removed later. Only modules
         # allowed by the current subscription are considered.
-        if catalog_version < 13:
+        if catalog_version < 12:
             additions = [
-                name for name in ("shortcuts", "store", "quickpanel")
+                name for name in ("shortcuts", "store")
                 if name in {str(x).lower() for x in payload.get("allowed_modules", [])}
             ]
             merged = list(dict.fromkeys([str(x).lower() for x in stored_enabled] + additions))
@@ -99,8 +98,8 @@ async def run_worker(payload: dict[str, Any]) -> None:
                 await storage.set("framework", "enabled_modules", merged)
     else:
         enabled = list(enabled) if isinstance(enabled, list) else []
-    if catalog_version < 13:
-        await storage.set("framework", "catalog_version", 13)
+    if catalog_version < 12:
+        await storage.set("framework", "catalog_version", 12)
 
     config = WorkerConfig(
         api_id=int(payload["api_id"]),
@@ -113,7 +112,6 @@ async def run_worker(payload: dict[str, Any]) -> None:
         command_rate_limit=max(0, int(payload.get("command_rate_limit", 8) or 0)),
         command_rate_window=max(0.2, float(payload.get("command_rate_window", 2.0) or 2.0)),
         subscription_until=float(payload.get("subscription_until", 0) or 0),
-        control_bot_token=str(payload.get("control_bot_token") or "") or None,
     )
     module_config = SimpleNamespace(
         **vars(config),
@@ -126,7 +124,7 @@ async def run_worker(payload: dict[str, Any]) -> None:
         api_id=config.api_id,
         api_hash=config.api_hash,
         session_string=config.string_session,
-        app_version="NexusUserbot/13.3",
+        app_version="NexusUserbot/11.0",
     )
     loader = ModuleLoader(
         app=app,
