@@ -131,3 +131,5 @@ This is **Hikka-inspired, not Hikka-compatible**. It does not claim drop-in supp
 ## v13.1.0 UI update
 
 The v13.1 update expands the Hikka-style command/module browsing UX with native pagination, favorites, details, store search navigation and richer Control Bot inline controls.
+
+> v13.3.0 UI note: interactive inline buttons are published by the Control Bot, because Telegram callback queries belong to bot messages.

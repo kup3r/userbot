@@ -178,3 +178,5 @@ See `README_V13_HIKKA_PLUS.md` for the new Command Center, Module Center, native
 ## v13.1.0 UI update
 
 Interactive UI is now used across command, module and store browsers. `.cmds`, `.modules` and `.inline` have paginated inline keyboards; Control Bot status/modules/connect views also expose navigation buttons. The Store lifecycle and callback handler were hardened for reloads.
+
+> v13.3.0 UI note: interactive inline buttons are published by the Control Bot, because Telegram callback queries belong to bot messages.

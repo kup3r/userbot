@@ -180,3 +180,5 @@ store_ratings
 - cookies или другие секреты.
 
 Static scanner — эвристическая проверка, а не sandbox. Не публикуй код, которому ты не доверяешь.
+
+> v13.3.0 UI note: interactive inline buttons are published by the Control Bot, because Telegram callback queries belong to bot messages.
