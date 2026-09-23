@@ -77,7 +77,8 @@ class Module(BaseModule):
                 )
             lines.append("")
         lines.append("Подробно: <code>.help module</code>")
-        lines.append("Поиск: <code>.help search text</code>")
+        lines.append("Команды страницами: <code>.cmds 2</code>")
+        lines.append("Поиск: <code>.cmds search text</code>")
         return "\n".join(lines)[:4000]
 
     def _module_text(self, entry: Any) -> str:

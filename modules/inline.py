@@ -25,7 +25,7 @@ from core.utils import format_uptime
 class Module(BaseModule):
     name = "Inline Dashboard"
     description = "Нативная интерактивная панель управления в стиле современных modular userbots."
-    version = "10.0.0"
+    version = "12.0.1"
     category = "Core"
     command_group = 90
 
@@ -128,13 +128,26 @@ class Module(BaseModule):
             elif data == self.CALLBACK + "loops":
                 await self._edit(message, self._loops_text(), self._section_keyboard("home"))
             elif data == self.CALLBACK + "commands":
-                await self._edit(message, self._commands_text(), self._section_keyboard("home"))
+                await self._show_commands(message, 1, "all", "")
+            elif data.startswith(self.CALLBACK + "cmdpage:"):
+                parts = data.split(":", 4)
+                page = self._safe_int(parts[2], 1) if len(parts) > 2 else 1
+                mode = parts[3] if len(parts) > 3 else "all"
+                payload = parts[4] if len(parts) > 4 else ""
+                await self._show_commands(message, page, mode, payload)
+            elif data.startswith(self.CALLBACK + "cmdcat:"):
+                payload = data.rsplit(":", 1)[1]
+                await self._show_commands(message, 1, "category", payload)
+            elif data == self.CALLBACK + "cmdfav":
+                await self._show_commands(message, 1, "fav", "")
             elif data == self.CALLBACK + "history":
                 await self._edit(message, self._history_text(), self._section_keyboard("home"))
             elif data == self.CALLBACK + "security":
                 await self._edit(message, self._security_text(), self._section_keyboard("home"))
             elif data == self.CALLBACK + "data":
                 await self._edit(message, self._data_text(), self._data_keyboard())
+            elif data == self.CALLBACK + "mods_store":
+                await self._show_store_hint(message)
             elif data == self.CALLBACK + "notes":
                 await self._show_storage_preview(message, "notes", "🗒 Последние заметки")
             elif data == self.CALLBACK + "bookmarks":
@@ -392,6 +405,70 @@ class Module(BaseModule):
         buttons.append(nav_row)
         await self._edit(message, "\n".join(lines)[:4090], InlineKeyboardMarkup(inline_keyboard=buttons))
 
+    def _command_rows(self, mode: str = "all", payload: str = "") -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for entry in self.loader.list_modules():
+            if getattr(entry.instance, "hidden", False) or self.loader.is_module_hidden(entry.module_name):
+                continue
+            category = str(getattr(entry.instance, "category", "General") or "General")
+            for meta, desc in entry.instance.iter_commands():
+                rows.append({
+                    "name": meta.name, "aliases": tuple(meta.aliases),
+                    "description": desc, "category": category,
+                    "module": entry.module_name,
+                })
+        rows.sort(key=lambda x: (x["category"].casefold(), x["name"]))
+        p = str(payload or "").casefold()
+        if mode == "category":
+            rows = [r for r in rows if r["category"].casefold() == p]
+        elif mode == "search":
+            rows = [r for r in rows if p in " ".join([r["name"], r["module"], r["category"], r["description"], *r["aliases"]]).casefold()]
+        elif mode == "fav":
+            manager = self.loader.loaded.get("manager")
+            favs = set(getattr(manager.instance, "_command_favorites", []) if manager else [])
+            rows = [r for r in rows if r["name"] in favs]
+        return rows
+
+    async def _show_commands(self, message: Any, page: int, mode: str, payload: str) -> None:
+        rows = self._command_rows(mode, payload)
+        size = 7
+        pages = max(1, (len(rows) + size - 1) // size)
+        page = max(1, min(page, pages))
+        batch = rows[(page - 1) * size:page * size]
+        title = "⌨️ <b>Command Palette</b>"
+        if mode == "category":
+            title += f" · 📁 <b>{escape(payload)}</b>"
+        elif mode == "search":
+            title += f" · 🔎 <code>{escape(payload)}</code>"
+        elif mode == "fav":
+            title += " · ⭐"
+        lines = [title, f"Страница <b>{page}/{pages}</b> · команд <b>{len(rows)}</b>", ""]
+        for row in batch:
+            aliases = f" <i>({', '.join(self.get_prefix()+x for x in row['aliases'][:2])})</i>" if row["aliases"] else ""
+            lines.append(f"• <code>{escape(self.get_prefix()+row['name'])}</code>{aliases} · <i>{escape(row['module'])}</i>")
+            lines.append(f"  {escape(row['description'].splitlines()[0][:110])}")
+        if not batch:
+            lines.append("Нет команд в этом разделе.")
+        categories = sorted({r["category"] for r in self._command_rows()})[:6]
+        buttons: list[list[InlineKeyboardButton]] = []
+        if mode == "all" and page == 1:
+            for offset in range(0, len(categories), 3):
+                chunk = categories[offset:offset+3]
+                buttons.append([InlineKeyboardButton(f"📁 {c[:18]}", callback_data=self.CALLBACK + "cmdcat:" + c.replace(":", "_")[:28]) for c in chunk])
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=self.CALLBACK + f"cmdpage:{page-1}:{mode}:{payload[:28]}"))
+        nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data=self.CALLBACK + f"cmdpage:{page}:{mode}:{payload[:28]}"))
+        if page < pages:
+            nav.append(InlineKeyboardButton("➡️", callback_data=self.CALLBACK + f"cmdpage:{page+1}:{mode}:{payload[:28]}"))
+        buttons.append(nav)
+        buttons.append([
+            InlineKeyboardButton("⭐ Favorites", callback_data=self.CALLBACK + "cmdfav"),
+            InlineKeyboardButton("🔄 All", callback_data=self.CALLBACK + "commands"),
+        ])
+        buttons.append([InlineKeyboardButton("🏠", callback_data=self.CALLBACK + "home")])
+        await self._edit(message, "\n".join(lines)[:4090], InlineKeyboardMarkup(inline_keyboard=buttons))
+
     def _commands_text(self) -> str:
         rows = []
         for entry in self.loader.list_modules():
@@ -593,6 +670,19 @@ class Module(BaseModule):
             [InlineKeyboardButton("🏠", callback_data=self.CALLBACK + "home")],
         ])
 
+    async def _show_store_hint(self, message: Any) -> None:
+        prefix = self.get_prefix()
+        text = (
+            "🛒 <b>Module Store</b>\n\n"
+            "Каталог встроенных модулей доступен без внешнего сервера.\n\n"
+            f"<code>{escape(prefix)}store</code> — каталог\n"
+            f"<code>{escape(prefix)}store search text</code> — поиск\n"
+            f"<code>{escape(prefix)}store info module</code> — информация\n"
+            f"<code>{escape(prefix)}store install module</code> — включить\n"
+            f"<code>{escape(prefix)}store uninstall module</code> — отключить"
+        )
+        await self._edit(message, text, self._section_keyboard("home"))
+
     def _home_text(self) -> str:
         loaded = self.loader.list_modules()
         commands = sum(len(entry.instance.iter_commands()) for entry in loaded)
@@ -600,8 +690,8 @@ class Module(BaseModule):
         loops = sum(len(entry.instance.iter_loops()) for entry in loaded)
         plan = str(getattr(self.loader.config, "plan", "single"))
         return (
-            "🤖 <b>TENANT USERBOT</b>\n"
-            "<code>v10 · modular runtime</code>\n\n"
+            "🤖 <b>NEXUS USERBOT</b>\n"
+            "<code>v12.0.1 · modular runtime</code>\n\n"
             f"🧩 Modules  <b>{len(loaded)}</b>\n"
             f"⌨️ Commands <b>{commands}</b>\n"
             f"👁 Watchers <b>{watchers}</b>\n"
@@ -618,6 +708,7 @@ class Module(BaseModule):
                 InlineKeyboardButton("🧩 Modules", callback_data=self.CALLBACK + "mods"),
                 InlineKeyboardButton("⌨️ Commands", callback_data=self.CALLBACK + "commands"),
             ],
+            [InlineKeyboardButton("🛒 Module Store", callback_data=self.CALLBACK + "mods_store")],
             [
                 InlineKeyboardButton("📊 Stats", callback_data=self.CALLBACK + "stats"),
                 InlineKeyboardButton("🩺 Doctor", callback_data=self.CALLBACK + "doctor"),
