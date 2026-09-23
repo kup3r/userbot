@@ -111,7 +111,7 @@ class Config:
         basic_default = (
             "ping,help,profile,manager,framework,automation,prefixes,inline,universal,subscription,"
             "security,blacklist,system,notes,bookmarks,chatstats,chattools,chatinfo,search,activity,doctor,"
-            "macros,presets,watchdog,snippets,media,triggers,scheduler,exporter,sudo,dialogs,mentions,texttools,devtools,grep,quiet,variables,logs,scanner,download,chatrules"
+            "macros,presets,watchdog,snippets,media,triggers,scheduler,exporter,sudo,dialogs,mentions,texttools,devtools,grep,quiet,variables,logs,scanner,download,chatrules,shortcuts,store"
         )
         pro_default = basic_default + ",loader,backup,store"
         premium_default = pro_default + ",eval"
