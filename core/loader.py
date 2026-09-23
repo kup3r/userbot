@@ -8,6 +8,7 @@ custom modules are stored under the tenant's directory.
 from __future__ import annotations
 
 import asyncio
+import ast
 import importlib
 import time
 from collections import deque
@@ -52,10 +53,31 @@ class ModuleLoader:
         "bs4": "beautifulsoup4",
         "yaml": "PyYAML",
         "dotenv": "python-dotenv",
+        "telethon": "Telethon==1.45.0",
     }
     SCOPE_RE = re.compile(r"^\s*#\s*scope\s*:\s*(.+?)\s*$", re.IGNORECASE)
     REQUIRES_RE = re.compile(r"^\s*#\s*requires\s*:\s*(.+?)\s*$", re.IGNORECASE)
     AUTHOR_RE = re.compile(r"^\s*#\s*author(?:s)?\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
+    @classmethod
+    def detect_imports(cls, source: str) -> list[str]:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names.add(node.module.split(".", 1)[0])
+        return sorted(names)
+
+    @classmethod
+    def dependency_report(cls, source: str) -> dict[str, list[str]]:
+        imports = cls.detect_imports(source)
+        hints = [cls.IMPORT_TO_PIP[name] for name in imports if name in cls.IMPORT_TO_PIP]
+        return {"imports": imports, "pip_hints": sorted(set(hints))}
 
     def __init__(
         self,
@@ -347,7 +369,19 @@ class ModuleLoader:
             return True
 
         except Exception as exc:
-            error_text = f"{name}: {type(exc).__name__}: {exc}"
+            if isinstance(exc, ModuleNotFoundError) and getattr(exc, "name", None):
+                missing = str(exc.name)
+                hint = self.IMPORT_TO_PIP.get(missing, missing)
+                if missing == "telethon":
+                    error_text = (
+                        f"{name}: пакет Telethon отсутствует. Он включён в requirements v12.1; "
+                        f"сделай новый Render Deploy. Если это Hikka-модуль, одного Telethon "
+                        f"недостаточно: Hikka ориентирован на Telethon API и требует адаптации к Nexus/Pyrogram."
+                    )
+                else:
+                    error_text = f"{name}: не найден Python-пакет '{missing}'. Добавь '{hint}' в requirements.txt и сделай новый Render Deploy."
+            else:
+                error_text = f"{name}: {type(exc).__name__}: {exc}"
             self.load_errors.append(error_text)
             self.load_errors = self.load_errors[-50:]
             self.last_load_error[name] = error_text
@@ -592,6 +626,11 @@ class ModuleLoader:
                 f"Имя {name}.py зарезервировано встроенным модулем. Выбери другое имя."
             )
         metadata = self.parse_metadata(text)
+        dep_report = self.dependency_report(text)
+        metadata["imports"] = dep_report["imports"]
+        metadata["pip_hints"] = dep_report["pip_hints"]
+        if "telethon" in dep_report["imports"]:
+            metadata["framework_hint"] = "telethon / hikka-like"
         metadata.update(
             {
                 "filename": f"{name}.py",

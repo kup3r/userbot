@@ -47,22 +47,6 @@ def _modules(raw: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _public_base_url() -> str | None:
-    explicit = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-    render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
-    # On Render prefer the platform-provided public URL when a stale/local
-    # value such as localhost or 127.0.0.1 was accidentally left in env.
-    if render_url and explicit:
-        try:
-            from urllib.parse import urlparse
-            host = (urlparse(explicit).hostname or "").lower()
-            if host in {"localhost", "127.0.0.1", "::1"} or host.startswith("192.168.") or host.startswith("10."):
-                return render_url
-        except Exception:
-            return render_url
-    return explicit or render_url or None
-
-
 @dataclass
 class Config:
     api_id: int
@@ -127,7 +111,7 @@ class Config:
         basic_default = (
             "ping,help,profile,manager,framework,automation,prefixes,inline,universal,subscription,"
             "security,blacklist,system,notes,bookmarks,chatstats,chattools,chatinfo,search,activity,doctor,"
-            "macros,presets,watchdog,snippets,media,triggers,scheduler,exporter,sudo,dialogs,mentions,texttools,devtools,grep,quiet,variables,logs,scanner,download,chatrules,shortcuts,store,quickpanel"
+            "macros,presets,watchdog,snippets,media,triggers,scheduler,exporter,sudo,dialogs,mentions,texttools,devtools,grep,quiet,variables,logs,scanner,download,chatrules,shortcuts,store"
         )
         pro_default = basic_default + ",loader,backup,store"
         premium_default = pro_default + ",eval"
@@ -206,7 +190,7 @@ class Config:
             pro_days=durations[1],
             premium_stars=prices[2],
             premium_days=durations[2],
-            public_base_url=_public_base_url(),
+            public_base_url=(os.getenv("PUBLIC_BASE_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip() or None),
             allow_ephemeral_sqlite=allow_ephemeral_sqlite,
             command_rate_limit=max(0, int(os.getenv("COMMAND_RATE_LIMIT", "8"))),
             command_rate_window=max(0.2, float(os.getenv("COMMAND_RATE_WINDOW", "2"))),

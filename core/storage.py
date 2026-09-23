@@ -63,6 +63,12 @@ class Storage:
                         updated_at DOUBLE PRECISION NOT NULL,
                         PRIMARY KEY(tenant_id,namespace,key)
                     );
+CREATE TABLE IF NOT EXISTS module_store (
+                        module_name TEXT PRIMARY KEY, version TEXT NOT NULL DEFAULT '1.0.0', category TEXT NOT NULL DEFAULT 'General',
+                        author TEXT NOT NULL DEFAULT 'Nexus', description TEXT NOT NULL DEFAULT '', requirements TEXT NOT NULL DEFAULT '[]',
+                        source BYTEA NOT NULL, source_url TEXT, sha256 TEXT NOT NULL, published_by BIGINT, downloads INTEGER NOT NULL DEFAULT 0,
+                        created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL
+                    );
                     CREATE TABLE IF NOT EXISTS tenant_modules (
                         tenant_id BIGINT NOT NULL,
                         module_name TEXT NOT NULL,
@@ -104,7 +110,13 @@ class Storage:
         )
         await self._db.execute(
             """
-            CREATE TABLE IF NOT EXISTS tenant_modules(
+CREATE TABLE IF NOT EXISTS module_store(
+                module_name TEXT PRIMARY KEY, version TEXT NOT NULL DEFAULT '1.0.0', category TEXT NOT NULL DEFAULT 'General',
+                author TEXT NOT NULL DEFAULT 'Nexus', description TEXT NOT NULL DEFAULT '', requirements TEXT NOT NULL DEFAULT '[]',
+                source BLOB NOT NULL, source_url TEXT, sha256 TEXT NOT NULL, published_by INTEGER, downloads INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+                        CREATE TABLE IF NOT EXISTS tenant_modules(
                 module_name TEXT PRIMARY KEY,
                 filename TEXT NOT NULL,
                 source BLOB NOT NULL,
@@ -401,6 +413,61 @@ class Storage:
             # SQLite tenant storage does not need a separate audit table for local use.
         except Exception:
             return
+
+    async def list_store_modules(self, limit: int = 500) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 2000))
+        if self.is_postgres:
+            async with self._pg_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT * FROM module_store ORDER BY category,module_name LIMIT $1", limit)
+            raw = [dict(r) for r in rows]
+        else:
+            if self._db is None:
+                raise RuntimeError("Storage is not open")
+            async with self._db.execute("SELECT * FROM module_store ORDER BY category,module_name LIMIT ?", (limit,)) as cur:
+                rows = await cur.fetchall()
+            raw = [dict(r) for r in rows]
+        for item in raw:
+            try:
+                item["requirements"] = json.loads(item.get("requirements") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                item["requirements"] = []
+            item["source"] = bytes(item.get("source", b""))
+        return raw
+
+    async def get_store_module(self, module_name: str) -> dict[str, Any] | None:
+        name = str(module_name).strip().lower()
+        if self.is_postgres:
+            async with self._pg_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM module_store WHERE module_name=$1", name)
+            if not row:
+                return None
+            result = dict(row)
+        else:
+            if self._db is None:
+                raise RuntimeError("Storage is not open")
+            async with self._db.execute("SELECT * FROM module_store WHERE module_name=?", (name,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                return None
+            result = dict(row)
+        try:
+            result["requirements"] = json.loads(result.get("requirements") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            result["requirements"] = []
+        result["source"] = bytes(result.get("source", b""))
+        return result
+
+    async def increment_store_downloads(self, module_name: str) -> None:
+        name = str(module_name).strip().lower()
+        now = __import__('time').time()
+        if self.is_postgres:
+            async with self._pg_pool.acquire() as conn:
+                await conn.execute("UPDATE module_store SET downloads=downloads+1,updated_at=$2 WHERE module_name=$1", name, now)
+            return
+        if self._db is None:
+            raise RuntimeError("Storage is not open")
+        await self._db.execute("UPDATE module_store SET downloads=downloads+1,updated_at=? WHERE module_name=?", (now, name))
+        await self._db.commit()
 
     @asynccontextmanager
     async def namespace(self, namespace: str) -> AsyncIterator["NamespaceStore"]:
