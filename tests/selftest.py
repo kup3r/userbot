@@ -163,6 +163,18 @@ def test_v12_features() -> None:
     assert "class Module(BaseModule)" in shortcuts and "shortcut add" in shortcuts
 
 
+def test_store_v13_2() -> None:
+    store = (MODULES / "store.py").read_text(encoding="utf-8")
+    control = (ROOT / "service" / "control_bot.py").read_text(encoding="utf-8")
+    web = (ROOT / "service" / "web_admin.py").read_text(encoding="utf-8")
+    db = (ROOT / "service" / "db.py").read_text(encoding="utf-8")
+    assert '"⏮"' in store and '"⬅️"' in store and '"➡️"' in store and '"⏭"' in store
+    assert 'callback_data="adm:store:help"' in control
+    assert "async def _send_admin_store_page" in control
+    assert '@self.router.get("/store"' in web
+    assert all(name in db for name in ("store_modules", "store_releases", "store_ratings"))
+
+
 def main() -> None:
     tests = [
         test_python_syntax,
@@ -177,6 +189,7 @@ def main() -> None:
         test_render_config,
         test_schema_has_core_tables,
         test_v12_features,
+        test_store_v13_2,
     ]
     for test in tests:
         test()
