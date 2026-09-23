@@ -33,6 +33,7 @@ from core.config import Config
 from .manager import TenantManager
 from .module_store import NAME_RE, SourceAnalysis, analyze_source, scan_text_for_display
 from .phone_login import PhoneLoginManager
+from .panel_ui import PanelController
 
 
 logger = logging.getLogger("service.control_bot")
@@ -58,7 +59,9 @@ class ControlBot:
         self.dp.include_router(self.router)
         self.plans = manager.plans
         self.phone_login = phone_login
+        self._panel_controller = PanelController(self.bot, self.manager)
         self._register_handlers()
+        self._panel_controller.register(self.router)
 
     def is_owner(self, user_id: int) -> bool:
         return int(user_id) in self.config.owner_ids

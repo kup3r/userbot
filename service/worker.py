@@ -37,6 +37,7 @@ class WorkerConfig:
     command_rate_limit: int = 8
     command_rate_window: float = 2.0
     subscription_until: float = 0.0
+    control_bot_token: str | None = None
 
 
 def _logging(tenant_dir: Path, level: str) -> None:
@@ -112,6 +113,7 @@ async def run_worker(payload: dict[str, Any]) -> None:
         command_rate_limit=max(0, int(payload.get("command_rate_limit", 8) or 0)),
         command_rate_window=max(0.2, float(payload.get("command_rate_window", 2.0) or 2.0)),
         subscription_until=float(payload.get("subscription_until", 0) or 0),
+        control_bot_token=str(payload.get("control_bot_token") or "") or None,
     )
     module_config = SimpleNamespace(
         **vars(config),
@@ -124,7 +126,7 @@ async def run_worker(payload: dict[str, Any]) -> None:
         api_id=config.api_id,
         api_hash=config.api_hash,
         session_string=config.string_session,
-        app_version="NexusUserbot/13.1",
+        app_version="NexusUserbot/13.3",
     )
     loader = ModuleLoader(
         app=app,

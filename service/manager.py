@@ -313,6 +313,7 @@ class TenantManager:
                 "session_string": session_string,
                 "session_name": f"tenant_{user_id}",
                 "owner_id": user_id,
+                "control_bot_token": self.config.control_bot_token,
             }
 
             proc = self.ctx.Process(
