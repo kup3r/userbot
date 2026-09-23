@@ -127,3 +127,7 @@ Callback handlers are owner-only by default and are automatically unloaded with 
 ## Compatibility statement
 
 This is **Hikka-inspired, not Hikka-compatible**. It does not claim drop-in support for Hikka's Telethon-specific runtime, inline bot ecosystem, or every third-party module. The project intentionally keeps its own lifecycle, Pyrogram handlers and multi-tenant isolation model.
+
+## v13.1.0 UI update
+
+The v13.1 update expands the Hikka-style command/module browsing UX with native pagination, favorites, details, store search navigation and richer Control Bot inline controls.

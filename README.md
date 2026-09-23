@@ -171,3 +171,10 @@ Render Free Web Service
 The store works out of the box from the built-in catalog; set `MODULE_STORE_INDEX_URL` only when you want an external HTTPS index.
 
 The new `shortcuts` module provides personal shortcuts such as `.shortcut add gp ping`, persisted per tenant.
+
+## v13 UI upgrade
+See `README_V13_HIKKA_PLUS.md` for the new Command Center, Module Center, native dashboard controls, Store UI, Quick Panel and Control Bot admin/customer buttons.
+
+## v13.1.0 UI update
+
+Interactive UI is now used across command, module and store browsers. `.cmds`, `.modules` and `.inline` have paginated inline keyboards; Control Bot status/modules/connect views also expose navigation buttons. The Store lifecycle and callback handler were hardened for reloads.
