@@ -162,3 +162,12 @@ Render Free Web Service
                                   + module_history
                                   + audit
 ```
+
+
+## v12 Command Hub & Store
+
+`.cmds` is paginated and supports categories, search, module filtering and favorites. Use `.favcmd add <command>` to pin personal commands. `.inline` exposes the same command palette with buttons.
+
+The store works out of the box from the built-in catalog; set `MODULE_STORE_INDEX_URL` only when you want an external HTTPS index.
+
+The new `shortcuts` module provides personal shortcuts such as `.shortcut add gp ping`, persisted per tenant.
