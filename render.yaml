@@ -1,0 +1,71 @@
+services:
+  - type: web
+    name: nexus-userbot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: CONTROL_BOT_TOKEN
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: SESSION_ENCRYPTION_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPPORT_USERNAME
+        sync: false
+      - key: ADMIN_WEB_USER
+        value: admin
+      - key: ADMIN_WEB_PASSWORD
+        sync: false
+      - key: SERVICE_MODE
+        value: multi
+      - key: DATA_DIR
+        value: /tmp/nexus-userbot
+      - key: ALLOW_EPHEMERAL_SQLITE
+        value: "false"
+      - key: COMMAND_PREFIX
+        value: "."
+      - key: LOG_LEVEL
+        value: INFO
+      - key: EVAL_ENABLED
+        value: "false"
+      - key: CUSTOM_MODULES_ENABLED
+        value: "true"
+      - key: MAX_WORKERS
+        value: "1"
+      - key: TRIAL_DAYS
+        value: "3"
+      - key: REFERRAL_BONUS_DAYS
+        value: "7"
+      - key: BASIC_CUSTOM_MODULES
+        value: "5"
+      - key: PRO_CUSTOM_MODULES
+        value: "20"
+      - key: PREMIUM_CUSTOM_MODULES
+        value: "50"
+      - key: COMMAND_RATE_LIMIT
+        value: "8"
+      - key: COMMAND_RATE_WINDOW
+        value: "2"
+      - key: PLAN_BASIC_STARS
+        value: "50"
+      - key: PLAN_BASIC_DAYS
+        value: "30"
+      - key: PLAN_PRO_STARS
+        value: "120"
+      - key: PLAN_PRO_DAYS
+        value: "90"
+      - key: PLAN_PREMIUM_STARS
+        value: "300"
+      - key: PLAN_PREMIUM_DAYS
+        value: "365"
