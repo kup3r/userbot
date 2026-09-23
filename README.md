@@ -172,20 +172,10 @@ The store works out of the box from the built-in catalog; set `MODULE_STORE_INDE
 
 The new `shortcuts` module provides personal shortcuts such as `.shortcut add gp ping`, persisted per tenant.
 
+## Module Store v12.2
 
-## Nexus Module Store
+Admin: reply `/store_publish` to a `.py` document. Then use `.store` in any tenant to browse the catalog and install modules through inline buttons. `/store_list` lists published modules and `/store_unpublish name` hides one.
 
-Public catalog: `/store`
-Admin catalog/editor: `/admin/store`
+`.cmds` now has real inline pagination, category buttons, favorites and per-command info pages.
 
-Publish from Control Bot (admin): reply to a `.py` document with:
-`/storeadd name version category`
-
-List/delete from Control Bot:
-`/storelist` and `/storedelete name`
-
-A published module is stored in PostgreSQL. Tenant workers install the stored source directly, so the catalog does not depend on Render's ephemeral filesystem.
-
-## Module dependencies
-
-The runtime ships with Telethon 1.45.0 because many third-party modules import it. This fixes a missing-package error at import time. It does not automatically make arbitrary Hikka modules compatible: Hikka uses a Telethon-oriented runtime with its own loader, module registry, utils and decorators. Simple Telethon-dependent Nexus modules can work once their dependencies are present; full Hikka modules need an adapter/port.
+Custom module imports and runtime callbacks guard against `BaseException`; known worker-killing calls are blocked by the scanner.
