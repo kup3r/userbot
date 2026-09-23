@@ -165,10 +165,14 @@ class BaseModule:
             self._loop_tasks.pop(key, None)
             if _task.cancelled():
                 return
-            with contextlib.suppress(Exception):
+            try:
                 exc = _task.exception()
-                if exc:
-                    self.loader.record_runtime_error(self.name, key, exc)
+            except BaseException as fatal:
+                exc = fatal
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                safe_exc = exc if isinstance(exc, Exception) else RuntimeError(f"{type(exc).__name__}: {exc}")
+                self.loader.record_runtime_error(self.name, key, safe_exc)
+                logger.error("Background task failed in %s.%s: %s", self.name, key, safe_exc, exc_info=(type(exc), exc, exc.__traceback__))
 
         task.add_done_callback(done)
         return task
@@ -256,8 +260,11 @@ class BaseModule:
                         )
                         self.loader.record_command(_command_name, message)
                         await _method(ctx)
-                    except Exception as exc:
-                        self.loader.record_runtime_error(self.name, _command_name, exc)
+                    except BaseException as exc:
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        safe_exc = exc if isinstance(exc, Exception) else RuntimeError(f"{type(exc).__name__}: {exc}")
+                        self.loader.record_runtime_error(self.name, _command_name, safe_exc)
                         logger.exception("Command failed in %s.%s", self.name, _command_name)
                         try:
                             await message.reply_text(
@@ -307,8 +314,11 @@ class BaseModule:
                         return
                     self.loader.record_callback(_name)
                     await _method(query, match)
-                except Exception as exc:
-                    self.loader.record_runtime_error(self.name, f"callback:{_name}", exc)
+                except BaseException as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    safe_exc = exc if isinstance(exc, Exception) else RuntimeError(f"{type(exc).__name__}: {exc}")
+                    self.loader.record_runtime_error(self.name, f"callback:{_name}", safe_exc)
                     logger.exception("Callback failed in %s.%s", self.name, _name)
                     with contextlib.suppress(Exception):
                         await query.answer(f"Ошибка: {type(exc).__name__}", show_alert=True)
@@ -340,8 +350,11 @@ class BaseModule:
                         return
                     self.loader.record_watcher(_name)
                     await _method(message)
-                except Exception as exc:
-                    self.loader.record_runtime_error(self.name, f"watcher:{_name}", exc)
+                except BaseException as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    safe_exc = exc if isinstance(exc, Exception) else RuntimeError(f"{type(exc).__name__}: {exc}")
+                    self.loader.record_runtime_error(self.name, f"watcher:{_name}", safe_exc)
                     logger.exception("Watcher failed in %s.%s", self.name, _name)
 
             handler = MessageHandler(callback, event_filter)
