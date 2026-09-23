@@ -61,6 +61,9 @@ def worker_entry(payload: dict[str, Any]) -> None:
         asyncio.run(run_worker(payload))
     except KeyboardInterrupt:
         pass
+    except BaseException:
+        logging.getLogger("tenant").exception("Tenant worker fatal exit: %s", payload.get("tenant_id"))
+        raise
 
 
 async def run_worker(payload: dict[str, Any]) -> None:
@@ -124,7 +127,7 @@ async def run_worker(payload: dict[str, Any]) -> None:
         api_id=config.api_id,
         api_hash=config.api_hash,
         session_string=config.string_session,
-        app_version="NexusUserbot/11.0",
+        app_version="NexusUserbot/12.2",
     )
     loader = ModuleLoader(
         app=app,
@@ -138,6 +141,15 @@ async def run_worker(payload: dict[str, Any]) -> None:
         max_custom_modules=int(payload.get("max_custom_modules", 0) or 0),
         prefixes=[config.command_prefix],
     )
+
+    # Remove stale module names left by an older plan/version before load_all.
+    # This prevents harmless "not allowed" modules from inflating failed count and
+    # makes plan downgrades deterministic.
+    stale = [name for name in loader.enabled_modules if not loader.can_load(name)]
+    if stale:
+        loader.enabled_modules = [name for name in loader.enabled_modules if name not in stale]
+        await loader.save_enabled()
+        logging.getLogger("tenant").info("Tenant %s: removed stale disabled modules: %s", tenant_id, ", ".join(stale))
 
     stop_event = asyncio.Event()
 

@@ -75,21 +75,6 @@ CREATE TABLE IF NOT EXISTS notice_log (
 );
 
 -- Per-tenant persistent key/value store used by modules.
-CREATE TABLE IF NOT EXISTS module_store (
-    module_name TEXT PRIMARY KEY,
-    version TEXT NOT NULL DEFAULT '1.0.0',
-    category TEXT NOT NULL DEFAULT 'General',
-    author TEXT NOT NULL DEFAULT 'Nexus',
-    description TEXT NOT NULL DEFAULT '',
-    requirements TEXT NOT NULL DEFAULT '[]',
-    source BLOB NOT NULL,
-    source_url TEXT,
-    sha256 TEXT NOT NULL,
-    published_by INTEGER,
-    downloads INTEGER NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
 CREATE TABLE IF NOT EXISTS tenant_kv (
     tenant_id BIGINT NOT NULL,
     namespace TEXT NOT NULL,
@@ -114,6 +99,40 @@ CREATE TABLE IF NOT EXISTS tenant_modules (
     PRIMARY KEY(tenant_id, module_name)
 );
 
+
+CREATE TABLE IF NOT EXISTS module_store (
+    name TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    source BYTEA NOT NULL,
+    version TEXT NOT NULL DEFAULT '1.0.0',
+    author TEXT NOT NULL DEFAULT 'Nexus',
+    description TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'General',
+    sha256 TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    published_by BIGINT,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_module_store_category ON module_store(category, name);
+CREATE TABLE IF NOT EXISTS module_store_versions (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    source BYTEA NOT NULL,
+    version TEXT NOT NULL,
+    author TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'General',
+    sha256 TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    published_by BIGINT,
+    created_at DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_module_store_versions_lookup ON module_store_versions(name, created_at DESC);
+
+
 -- Last N versions for each custom module.
 CREATE TABLE IF NOT EXISTS tenant_module_history (
     id BIGSERIAL PRIMARY KEY,
@@ -128,21 +147,35 @@ CREATE INDEX IF NOT EXISTS idx_module_history_lookup
     ON tenant_module_history(tenant_id, module_name, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS module_store (
-    module_name TEXT PRIMARY KEY,
+    name TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    source BLOB NOT NULL,
     version TEXT NOT NULL DEFAULT '1.0.0',
-    category TEXT NOT NULL DEFAULT 'General',
     author TEXT NOT NULL DEFAULT 'Nexus',
     description TEXT NOT NULL DEFAULT '',
-    requirements TEXT NOT NULL DEFAULT '[]',
-    source BYTEA NOT NULL,
-    source_url TEXT,
+    category TEXT NOT NULL DEFAULT 'General',
     sha256 TEXT NOT NULL,
-    published_by BIGINT,
-    downloads INTEGER NOT NULL DEFAULT 0,
-    created_at DOUBLE PRECISION NOT NULL,
-    updated_at DOUBLE PRECISION NOT NULL
+    metadata TEXT NOT NULL DEFAULT '{}',
+    published_by INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1
 );
-CREATE INDEX IF NOT EXISTS idx_module_store_category ON module_store(category);
+CREATE TABLE IF NOT EXISTS module_store_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    source BLOB NOT NULL,
+    version TEXT NOT NULL,
+    author TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'General',
+    sha256 TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    published_by INTEGER,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_module_store_versions_lookup ON module_store_versions(name, created_at DESC);
 CREATE TABLE IF NOT EXISTS tenant_audit (
     id BIGSERIAL PRIMARY KEY,
     tenant_id BIGINT NOT NULL,
@@ -301,6 +334,113 @@ class Database:
             await self._sqlite.close()
             self._sqlite = None
 
+
+    async def publish_store_module(
+        self,
+        *,
+        name: str,
+        filename: str,
+        source: bytes,
+        version: str,
+        author: str,
+        description: str,
+        category: str,
+        sha256: str,
+        metadata: dict[str, Any] | None = None,
+        published_by: int | None = None,
+    ) -> None:
+        now = time.time()
+        meta = json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":"))
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                previous = await conn.fetchrow("SELECT name,filename,source,version,author,description,category,sha256,metadata,published_by,created_at FROM module_store WHERE name=$1 AND enabled=1", str(name).lower())
+                if previous:
+                    await conn.execute(
+                        """INSERT INTO module_store_versions(name,filename,source,version,author,description,category,sha256,metadata,published_by,created_at)
+                           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+                        previous["name"], previous["filename"], bytes(previous["source"]), previous["version"], previous["author"], previous["description"], previous["category"], previous["sha256"], previous["metadata"], previous["published_by"], previous["created_at"],
+                    )
+                    await conn.execute("""DELETE FROM module_store_versions WHERE name=$1 AND id NOT IN (SELECT id FROM module_store_versions WHERE name=$1 ORDER BY created_at DESC,id DESC LIMIT 10)""", str(name).lower())
+                await conn.execute(
+                    """INSERT INTO module_store(name,filename,source,version,author,description,category,sha256,metadata,published_by,created_at,updated_at,enabled)
+                       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,1)
+                       ON CONFLICT(name) DO UPDATE SET filename=EXCLUDED.filename,source=EXCLUDED.source,version=EXCLUDED.version,
+                       author=EXCLUDED.author,description=EXCLUDED.description,category=EXCLUDED.category,sha256=EXCLUDED.sha256,
+                       metadata=EXCLUDED.metadata,published_by=EXCLUDED.published_by,updated_at=EXCLUDED.updated_at,enabled=1""",
+                    str(name).lower(), filename, bytes(source), version, author, description, category, sha256, meta,
+                    int(published_by) if published_by is not None else None, now,
+                )
+            return
+        db = self._sq()
+        previous = None
+        async with db.execute("SELECT name,filename,source,version,author,description,category,sha256,metadata,published_by,created_at FROM module_store WHERE name=? AND enabled=1", (str(name).lower(),)) as cur:
+            previous = await cur.fetchone()
+        if previous:
+            await db.execute(
+                """INSERT INTO module_store_versions(name,filename,source,version,author,description,category,sha256,metadata,published_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""", tuple(previous),
+            )
+            await db.execute("""DELETE FROM module_store_versions WHERE name=? AND id NOT IN (SELECT id FROM module_store_versions WHERE name=? ORDER BY created_at DESC,id DESC LIMIT 10)""", (str(name).lower(), str(name).lower()))
+        await db.execute(
+            """INSERT INTO module_store(name,filename,source,version,author,description,category,sha256,metadata,published_by,created_at,updated_at,enabled)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)
+               ON CONFLICT(name) DO UPDATE SET filename=excluded.filename,source=excluded.source,version=excluded.version,
+               author=excluded.author,description=excluded.description,category=excluded.category,sha256=excluded.sha256,
+               metadata=excluded.metadata,published_by=excluded.published_by,updated_at=excluded.updated_at,enabled=1""",
+            (str(name).lower(), filename, source, version, author, description, category, sha256, meta,
+             int(published_by) if published_by is not None else None, now, now),
+        )
+        await db.commit()
+
+    async def list_store_modules(self, limit: int = 5000) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 5000))
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                rows = await conn.fetch("SELECT * FROM module_store WHERE enabled=1 ORDER BY category,name LIMIT $1", limit)
+            return [dict(r) for r in rows]
+        db = self._sq()
+        async with db.execute("SELECT * FROM module_store WHERE enabled=1 ORDER BY category,name LIMIT ?", (limit,)) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_store_module(self, name: str) -> dict[str, Any] | None:
+        name = str(name).lower().strip()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM module_store WHERE name=$1 AND enabled=1", name)
+            return dict(row) if row else None
+        db = self._sq()
+        async with db.execute("SELECT * FROM module_store WHERE name=? AND enabled=1", (name,)) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_store_versions(self, name: str, limit: int = 10) -> list[dict[str, Any]]:
+        name = str(name).lower().strip()
+        limit = max(1, min(int(limit), 20))
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                rows = await conn.fetch("SELECT id,name,filename,version,author,description,category,sha256,metadata,published_by,created_at FROM module_store_versions WHERE name=$1 ORDER BY created_at DESC,id DESC LIMIT $2", name, limit)
+            result=[dict(r) for r in rows]
+        else:
+            db=self._sq()
+            async with db.execute("SELECT id,name,filename,version,author,description,category,sha256,metadata,published_by,created_at FROM module_store_versions WHERE name=? ORDER BY created_at DESC,id DESC LIMIT ?", (name,limit)) as cur:
+                rows=await cur.fetchall()
+            result=[dict(r) for r in rows]
+        for row in result:
+            try: row["metadata"]=json.loads(row.get("metadata") or "{}")
+            except (TypeError,json.JSONDecodeError): row["metadata"]={}
+        return result
+
+    async def remove_store_module(self, name: str) -> bool:
+        name = str(name).lower().strip()
+        if self.is_postgres:
+            async with self._pg().acquire() as conn:
+                result = await conn.execute("UPDATE module_store SET enabled=0,updated_at=$2 WHERE name=$1", name, time.time())
+            return result.endswith("1")
+        db = self._sq()
+        cur = await db.execute("UPDATE module_store SET enabled=0,updated_at=? WHERE name=?", (time.time(), name))
+        await db.commit()
+        return cur.rowcount > 0
 
     async def list_custom_module_names(self, tenant_id: int) -> list[str]:
         tenant_id = int(tenant_id)
@@ -718,102 +858,6 @@ class Database:
         await db.commit()
         return cur.rowcount == 1
 
-
-    async def upsert_store_module(
-        self, module_name: str, version: str, category: str, author: str,
-        description: str, requirements: list[str], source: bytes,
-        source_url: str | None, sha256: str, published_by: int | None = None,
-    ) -> None:
-        name = str(module_name).strip().lower()
-        reqs = [str(x).strip() for x in requirements if str(x).strip()]
-        payload = json.dumps(reqs, ensure_ascii=False, separators=(",", ":"))
-        now = time.time()
-        if self.is_postgres:
-            async with self._pg().acquire() as conn:
-                await conn.execute(
-                    """INSERT INTO module_store(module_name,version,category,author,description,requirements,source,source_url,sha256,published_by,downloads,created_at,updated_at)
-                       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$11,$11)
-                       ON CONFLICT(module_name) DO UPDATE SET
-                       version=EXCLUDED.version,category=EXCLUDED.category,author=EXCLUDED.author,description=EXCLUDED.description,
-                       requirements=EXCLUDED.requirements,source=EXCLUDED.source,source_url=EXCLUDED.source_url,sha256=EXCLUDED.sha256,
-                       published_by=EXCLUDED.published_by,updated_at=EXCLUDED.updated_at""",
-                    name, str(version), str(category), str(author), str(description), payload, bytes(source), source_url, str(sha256).lower(), published_by, now,
-                )
-            return
-        db = self._sq()
-        await db.execute(
-            """INSERT INTO module_store(module_name,version,category,author,description,requirements,source,source_url,sha256,published_by,downloads,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?)
-               ON CONFLICT(module_name) DO UPDATE SET
-               version=excluded.version,category=excluded.category,author=excluded.author,description=excluded.description,
-               requirements=excluded.requirements,source=excluded.source,source_url=excluded.source_url,sha256=excluded.sha256,
-               published_by=excluded.published_by,updated_at=excluded.updated_at""",
-            (name, str(version), str(category), str(author), str(description), payload, bytes(source), source_url, str(sha256).lower(), published_by, now, now),
-        )
-        await db.commit()
-
-    async def get_store_module(self, module_name: str) -> dict[str, Any] | None:
-        name = str(module_name).strip().lower()
-        if self.is_postgres:
-            async with self._pg().acquire() as conn:
-                row = await conn.fetchrow("SELECT * FROM module_store WHERE module_name=$1", name)
-            if not row:
-                return None
-            result = dict(row)
-        else:
-            db = self._sq()
-            async with db.execute("SELECT * FROM module_store WHERE module_name=?", (name,)) as cur:
-                row = await cur.fetchone()
-            if not row:
-                return None
-            result = dict(row)
-        try:
-            result["requirements"] = json.loads(result.get("requirements") or "[]")
-        except (TypeError, json.JSONDecodeError):
-            result["requirements"] = []
-        result["source"] = bytes(result.get("source", b""))
-        return result
-
-    async def list_store_modules(self, limit: int = 500) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 2000))
-        if self.is_postgres:
-            async with self._pg().acquire() as conn:
-                rows = await conn.fetch("SELECT * FROM module_store ORDER BY category,module_name LIMIT $1", limit)
-            raw = [dict(r) for r in rows]
-        else:
-            db = self._sq()
-            async with db.execute("SELECT * FROM module_store ORDER BY category,module_name LIMIT ?", (limit,)) as cur:
-                rows = await cur.fetchall()
-            raw = [dict(r) for r in rows]
-        for item in raw:
-            try:
-                item["requirements"] = json.loads(item.get("requirements") or "[]")
-            except (TypeError, json.JSONDecodeError):
-                item["requirements"] = []
-            item["source"] = bytes(item.get("source", b""))
-        return raw
-
-    async def delete_store_module(self, module_name: str) -> bool:
-        name = str(module_name).strip().lower()
-        if self.is_postgres:
-            async with self._pg().acquire() as conn:
-                result = await conn.execute("DELETE FROM module_store WHERE module_name=$1", name)
-            return str(result).endswith("1")
-        db = self._sq()
-        cur = await db.execute("DELETE FROM module_store WHERE module_name=?", (name,))
-        await db.commit()
-        return cur.rowcount == 1
-
-    async def increment_store_downloads(self, module_name: str) -> None:
-        name = str(module_name).strip().lower()
-        now = time.time()
-        if self.is_postgres:
-            async with self._pg().acquire() as conn:
-                await conn.execute("UPDATE module_store SET downloads=downloads+1,updated_at=$2 WHERE module_name=$1", name, now)
-            return
-        db = self._sq()
-        await db.execute("UPDATE module_store SET downloads=downloads+1,updated_at=? WHERE module_name=?", (now, name))
-        await db.commit()
 
 def decode_modules(value: Any) -> list[str]:
     if isinstance(value, list):

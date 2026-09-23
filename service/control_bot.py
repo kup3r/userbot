@@ -6,9 +6,12 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
 import time
 import uuid
+import ast
+import hashlib
+import re
+from pathlib import Path
 from html import escape
 from typing import Any
 
@@ -38,6 +41,65 @@ logger = logging.getLogger("service.control_bot")
 
 class ConnectState(StatesGroup):
     waiting_session = State()
+
+
+_STORE_META_RE = {
+    "version": re.compile(r"^\s*#\s*version\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    "author": re.compile(r"^\s*#\s*author(?:s)?\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    "category": re.compile(r"^\s*#\s*category\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+}
+
+
+def _analyze_store_source(source: bytes, filename: str) -> dict[str, Any]:
+    if len(source) > 2 * 1024 * 1024:
+        raise ValueError("Модуль превышает лимит 2 MiB.")
+    text = source.decode("utf-8-sig")
+    tree = ast.parse(text, filename=filename, mode="exec")
+    from modules.security import SecurityScanner
+    report = SecurityScanner.scan(text, filename)
+    if report.blocked:
+        raise ValueError("Security Scanner заблокировал модуль до публикации.")
+    module_class = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Module"), None)
+    if module_class is None:
+        raise ValueError("В модуле должен быть класс Module.")
+    filename_clean = re.sub(r"[^A-Za-z0-9_]+", "_", Path(filename).stem).strip("_").lower()
+    if not filename_clean:
+        filename_clean = "module_" + hashlib.sha256(source).hexdigest()[:8]
+    if filename_clean in {"help", "loader", "system", "inline", "store"}:
+        raise ValueError("Имя совпадает со встроенным модулем и зарезервировано.")
+
+    def literal(name: str) -> str | None:
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                value = node.value
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id == name and isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        return value.value.strip()
+        for node in module_class.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                value = node.value
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id == name and isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        return value.value.strip()
+        return None
+
+    def comment(key: str, default: str) -> str:
+        m = re.search(rf"^\s*#\s*{key}\s*:\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)
+        return m.group(1).strip() if m else default
+
+    return {
+        "name": filename_clean,
+        "filename": f"{filename_clean}.py",
+        "source": source,
+        "version": (literal("__version__") or literal("version") or comment("version", "1.0.0"))[:64],
+        "author": (literal("__author__") or literal("author") or comment("author", "Community"))[:128],
+        "category": (literal("category") or comment("category", "Community"))[:64],
+        "description": (literal("description") or "Модуль сообщества Nexus.")[:300],
+        "sha256": hashlib.sha256(source).hexdigest(),
+        "metadata": {"security_score": report.score, "published": True},
+    }
 
 
 class ControlBot:
@@ -111,7 +173,7 @@ class ControlBot:
                 "/cancel — отменить ввод сессии\n"
                 "/trial — одноразовый пробный период\n"
                 "/promo CODE — активировать промокод\n"
-                "/ref — реферальная ссылка\n/storeadd — опубликовать модуль (админ)\n/storelist — каталог (админ)\n\n"
+                "/ref — реферальная ссылка\n\n"
                 "Для оплаты цифрового сервиса используется Telegram Stars."
             )
 
@@ -461,6 +523,83 @@ class ControlBot:
                 f"Сохрани сообщение об успешной оплате и обратись к {escape(support)}."
             )
 
+        @r.message(Command("store_publish"))
+        async def store_publish(message: Message) -> None:
+            if not self.is_owner(message.from_user.id):
+                return
+            reply = message.reply_to_message
+            if reply is None or reply.document is None:
+                await message.answer("Использование: ответь <code>/store_publish</code> на .py файл.")
+                return
+            filename = reply.document.file_name or "module.py"
+            if not filename.lower().endswith(".py"):
+                await message.answer("❌ Нужно ответить именно на .py файл.")
+                return
+            try:
+                data = await reply.download(in_memory=True)
+                source = data.getvalue() if hasattr(data, "getvalue") else bytes(data)
+                meta = _analyze_store_source(source, filename)
+                command_parts = (message.text or "").split(maxsplit=1)
+                changelog = command_parts[1].strip() if len(command_parts) > 1 else ""
+                if changelog:
+                    meta["metadata"]["changelog"] = changelog[:1500]
+                await self.manager.db.publish_store_module(
+                    name=meta["name"], filename=meta["filename"], source=meta["source"], version=meta["version"],
+                    author=meta["author"], description=meta["description"], category=meta["category"], sha256=meta["sha256"],
+                    metadata=meta["metadata"], published_by=message.from_user.id,
+                )
+                await message.answer(
+                    "✅ <b>Модуль опубликован</b>\n\n"
+                    f"Имя: <code>{escape(meta['name'])}</code>\n"
+                    f"Версия: <code>{escape(meta['version'])}</code>\n"
+                    f"Автор: <code>{escape(meta['author'])}</code>\n"
+                    f"SHA-256: <code>{meta['sha256']}</code>\n\n"
+                    "Теперь пользователи увидят его в <code>.store</code> и смогут установить через inline-кнопку."
+                )
+            except Exception as exc:
+                await message.answer(f"❌ Публикация: <code>{escape(type(exc).__name__)}: {escape(str(exc))}</code>")
+
+        @r.message(Command("store_list"))
+        async def store_list(message: Message) -> None:
+            if not self.is_owner(message.from_user.id):
+                return
+            rows = await self.manager.db.list_store_modules(500)
+            if not rows:
+                await message.answer("🛒 Магазин пока пуст.\nОтветь /store_publish на .py файл.")
+                return
+            lines = ["🛒 <b>Published Store</b>", ""]
+            for row in rows:
+                lines.append(f"• <code>{escape(str(row['name']))}</code> v{escape(str(row['version']))} · {escape(str(row['category']))}")
+            await message.answer("\n".join(lines)[:3900])
+
+        @r.message(Command("store_versions"))
+        async def store_versions(message: Message) -> None:
+            if not self.is_owner(message.from_user.id):
+                return
+            parts=(message.text or "").split()
+            if len(parts)<2:
+                await message.answer("Использование: <code>/store_versions module</code>")
+                return
+            rows=await self.manager.db.list_store_versions(parts[1],10)
+            if not rows:
+                await message.answer("История публикаций пуста или модуль не найден.")
+                return
+            lines=[f"🗂 <b>Store Versions</b> · <code>{escape(parts[1].lower())}</code>",""]
+            for i,row in enumerate(rows,1):
+                lines.append(f"#{i} · v{escape(str(row.get('version') or '—'))} · {escape(str(row.get('author') or '—'))} · {_format_timestamp(float(row.get('created_at') or 0))}")
+            await message.answer("\n".join(lines)[:3900])
+
+        @r.message(Command("store_unpublish"))
+        async def store_unpublish(message: Message) -> None:
+            if not self.is_owner(message.from_user.id):
+                return
+            parts = (message.text or "").split()
+            if len(parts) < 2:
+                await message.answer("Использование: <code>/store_unpublish module</code>")
+                return
+            ok = await self.manager.db.remove_store_module(parts[1])
+            await message.answer(f"{'✅' if ok else '❌'} {escape(parts[1])}: {'скрыт из Store' if ok else 'не найден'}")
+
         @r.message(Command("refund"))
         async def refund_command(message: Message) -> None:
             if not self.is_owner(message.from_user.id):
@@ -537,6 +676,57 @@ class ControlBot:
                 "Отправь следующим сообщением только строку сессии. Сообщение будет удалено после получения.",
             )
 
+        @r.callback_query(F.data == "home:store")
+        async def home_store_callback(callback: CallbackQuery) -> None:
+            if callback.message and callback.message.chat.type != "private":
+                await callback.answer("Открой Control Bot в личном чате.", show_alert=True)
+                return
+            await callback.answer()
+            rows = await self.manager.db.list_store_modules(20)
+            lines = ["🛒 <b>Nexus Module Store</b>", ""]
+            if not rows:
+                lines.append("Пока опубликованных community-модулей нет.")
+            else:
+                for row in rows:
+                    lines.append(f"• <code>{escape(str(row['name']))}</code> · v{escape(str(row['version']))} · {escape(str(row['category']))}")
+                    lines.append(f"  {escape(str(row['description'])[:100])}")
+                lines.extend(["", "Установить модули можно после подключения своего userbot через <code>.store</code>."])
+            lines.append("")
+            lines.append("Публичный каталог только для просмотра; установка выполняется из твоего tenant.")
+            if callback.message:
+                await callback.message.edit_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="home:back")]]))
+
+        @r.callback_query(F.data == "home:back")
+        async def home_back_callback(callback: CallbackQuery) -> None:
+            await callback.answer()
+            user = await self.manager.register(callback.from_user)
+            if callback.message:
+                await callback.message.edit_text(self._user_home(user), reply_markup=self._home_keyboard())
+
+        @r.callback_query(F.data == "home:trial")
+        async def home_trial_callback(callback: CallbackQuery) -> None:
+            await callback.answer()
+            await self.manager.register(callback.from_user)
+            try:
+                until = await self.manager.start_trial(callback.from_user.id)
+                await self.bot.send_message(callback.from_user.id, f"🎁 <b>Trial активирован</b>\n\nДо: <code>{_format_timestamp(until)}</code>\n\nНажми /connect для подключения аккаунта.")
+            except Exception as exc:
+                await self.bot.send_message(callback.from_user.id, f"❌ Trial: <code>{escape(str(exc))}</code>")
+
+        @r.callback_query(F.data == "home:ref")
+        async def home_ref_callback(callback: CallbackQuery) -> None:
+            await callback.answer()
+            user = await self.manager.register(callback.from_user)
+            meta = await self.manager.db.ensure_account_meta(callback.from_user.id)
+            try:
+                me = await self.bot.get_me()
+                username = me.username or ""
+            except Exception:
+                username = ""
+            code = str(meta.get("referral_code") or "")
+            link = f"https://t.me/{username}?start={code}" if username and code else code
+            await self.bot.send_message(callback.from_user.id, "👥 <b>Рефералы</b>\n\n" f"Ссылка: <code>{escape(link)}</code>\n" f"Бонус: <b>{self.config.referral_bonus_days} дней</b> за первую оплату приглашённого.")
+
         @r.callback_query(F.data.startswith("home:"))
         async def home_callback(callback: CallbackQuery, state: FSMContext) -> None:
             action = str(callback.data).split(":", 1)[1]
@@ -568,6 +758,21 @@ class ControlBot:
                     return
                 await state.clear()
                 await self._send_connect_menu(callback.from_user.id)
+                return
+            if action == "help":
+                await self.bot.send_message(
+                    callback.from_user.id,
+                    "<b>Nexus Userbot</b>\n\n"
+                    "/start — меню\n"
+                    "/plans — тарифы\n"
+                    "/trial — пробный период\n"
+                    "/status — подписка и worker\n"
+                    "/connect — подключение\n"
+                    "/modules — доступные модули\n"
+                    "/promo CODE — промокод\n"
+                    "/ref — реферальная ссылка\n\n"
+                    "После подключения userbot используй .inline или .cmds."
+                )
                 return
 
         @r.message(Command("revenue"))
@@ -673,6 +878,43 @@ class ControlBot:
                     reply_markup=self._admin_user_keyboard(user_id),
                 )
 
+        @r.callback_query(F.data == "adm:store")
+        async def admin_store_callback(callback: CallbackQuery) -> None:
+            if not self.is_owner(callback.from_user.id):
+                await callback.answer("Доступ запрещён.", show_alert=True)
+                return
+            await callback.answer()
+            rows = await self.manager.db.list_store_modules(100)
+            lines = ["🛒 <b>Module Store</b>", ""]
+            if not rows:
+                lines.append("Store пуст.\n")
+            for row in rows:
+                lines.append(f"• <code>{escape(str(row['name']))}</code> · v{escape(str(row['version']))} · {escape(str(row['category']))}")
+            lines.extend(["", "Опубликовать: ответь <code>/store_publish</code> на .py файл."])
+            if callback.message:
+                await callback.message.edit_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Панель", callback_data="adm:h")]]))
+
+        @r.callback_query(F.data == "adm:revenue")
+        async def admin_revenue_callback(callback: CallbackQuery) -> None:
+            if not self.is_owner(callback.from_user.id):
+                await callback.answer("Доступ запрещён.", show_alert=True)
+                return
+            await callback.answer()
+            users = await self.manager.db.list_users(10000)
+            sales = await self.manager.db.sales_summary()
+            active = sum(float(u.get("subscription_until") or 0) > time.time() for u in users)
+            online = sum(1 for proc in self.manager.processes.values() if proc.is_alive())
+            text = (
+                "📈 <b>Revenue & Runtime</b>\n\n"
+                f"Users: <b>{len(users)}</b>\nActive: <b>{active}</b>\n"
+                f"Workers: <b>{online}/{self.config.max_workers}</b>\n"
+                f"Paid orders: <b>{sales['paid_orders']}</b>\n"
+                f"Stars: <b>{sales['paid_stars']} ⭐</b>\n"
+                f"Refunded: <b>{sales['refunded_stars']} ⭐</b>"
+            )
+            if callback.message:
+                await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Панель", callback_data="adm:h")]]))
+
         @r.callback_query(F.data == "adm:promos")
         async def admin_promos_callback(callback: CallbackQuery) -> None:
             if not self.is_owner(callback.from_user.id):
@@ -757,72 +999,6 @@ class ControlBot:
                 await message.answer("Пользователь не найден.")
                 return
             await message.answer(self._admin_user_text(user))
-
-        @r.message(Command("storeadd"))
-        async def storeadd_command(message: Message) -> None:
-            if not self.is_owner(message.from_user.id):
-                return
-            reply = message.reply_to_message
-            if not reply or not reply.document:
-                await message.answer("Ответь <code>/storeadd name version category</code> на .py файл.")
-                return
-            parts = (message.text or "").split(maxsplit=3)
-            name = parts[1] if len(parts) > 1 else (reply.document.file_name or "module.py").rsplit(".", 1)[0]
-            version = parts[2] if len(parts) > 2 else "1.0.0"
-            category = parts[3] if len(parts) > 3 else "Tools"
-            import io, hashlib
-            try:
-                tg_file = await self.bot.get_file(reply.document.file_id)
-                buf = io.BytesIO()
-                await self.bot.download_file(tg_file.file_path, destination=buf)
-                source = buf.getvalue()
-                if len(source) > 2 * 1024 * 1024:
-                    await message.answer("❌ Модуль больше 2 MiB.")
-                    return
-                text = source.decode("utf-8-sig")
-                compile(text, f"{name}.py", "exec")
-                from core.loader import ModuleLoader
-                from modules.security import SecurityScanner
-                report = SecurityScanner.scan(text, f"{name}.py")
-                if report.blocked:
-                    await message.answer("⛔ Security Scanner заблокировал модуль.")
-                    return
-                metadata = ModuleLoader.parse_metadata(text)
-                dep = ModuleLoader.dependency_report(text)
-                reqs = list(dict.fromkeys([str(x) for x in metadata.get("requires", [])] + dep.get("pip_hints", [])))
-                clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", str(name).lower())
-                if not clean_name or clean_name[0].isdigit():
-                    await message.answer("❌ Некорректное имя модуля.")
-                    return
-                sha = hashlib.sha256(source).hexdigest()
-                await self.manager.db.upsert_store_module(clean_name, version, category, str(metadata.get("authors") or "Nexus"), "", reqs, source, None, sha, int(message.from_user.id))
-                await message.answer(f"✅ <b>{escape(clean_name)}</b> опубликован в Nexus Store.\nSHA-256: <code>{sha}</code>\nRequirements: <code>{escape(', '.join(reqs) or 'none')}</code>")
-            except Exception as exc:
-                await message.answer(f"❌ Store publish: <code>{escape(type(exc).__name__)}: {escape(str(exc))}</code>")
-
-        @r.message(Command("storelist"))
-        async def storelist_command(message: Message) -> None:
-            if not self.is_owner(message.from_user.id):
-                return
-            rows = await self.manager.db.list_store_modules(100)
-            if not rows:
-                await message.answer("🧩 Store пуст. Публикуй: <code>/storeadd name version category</code> ответом на .py")
-                return
-            lines = ["🧩 <b>Nexus Store</b>", ""]
-            for row in rows:
-                lines.append(f"• <code>{escape(str(row['module_name']))}</code> v{escape(str(row['version']))} · {escape(str(row['category']))} · {int(row.get('downloads') or 0)} installs")
-            await message.answer("\n".join(lines))
-
-        @r.message(Command("storedelete"))
-        async def storedelete_command(message: Message) -> None:
-            if not self.is_owner(message.from_user.id):
-                return
-            parts = (message.text or "").split(maxsplit=1)
-            if len(parts) < 2:
-                await message.answer("Использование: <code>/storedelete module</code>")
-                return
-            ok = await self.manager.db.delete_store_module(parts[1].strip().lower())
-            await message.answer("✅ Удалён." if ok else "⚠️ Не найден.")
 
         @r.message(Command("grant"))
         async def grant_command(message: Message) -> None:
@@ -1012,6 +1188,8 @@ class ControlBot:
                     InlineKeyboardButton(text="👥 Users", callback_data="adm:users:0"),
                     InlineKeyboardButton(text="🎟 Promos", callback_data="adm:promos"),
                 ],
+                [InlineKeyboardButton(text="🛒 Module Store", callback_data="adm:store")],
+                [InlineKeyboardButton(text="📈 Revenue", callback_data="adm:revenue")],
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:h")],
             ]
         )
@@ -1186,8 +1364,16 @@ class ControlBot:
                     InlineKeyboardButton(text="📊 Статус", callback_data="home:status"),
                 ],
                 [
-                    InlineKeyboardButton(text="🧩 Модули", callback_data="home:modules"),
+                    InlineKeyboardButton(text="🎁 Trial", callback_data="home:trial"),
                     InlineKeyboardButton(text="🔐 Подключить", callback_data="home:connect"),
+                ],
+                [
+                    InlineKeyboardButton(text="🧩 Модули", callback_data="home:modules"),
+                    InlineKeyboardButton(text="🛒 Store", callback_data="home:store"),
+                ],
+                [
+                    InlineKeyboardButton(text="👥 Рефералы", callback_data="home:ref"),
+                    InlineKeyboardButton(text="📖 Помощь", callback_data="home:help"),
                 ],
             ]
         )
