@@ -8,6 +8,7 @@ loader API.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import platform
 import time
@@ -41,7 +42,7 @@ class ErrorBufferHandler(logging.Handler):
 class Module(BaseModule):
     name = "Manager"
     description = "Command hub, paginated help, favorites, runtime statistics and error buffer."
-    version = "12.0.1"
+    version = "13.2.0"
     category = "Core"
     NAMESPACE = "manager"
     CMD_CALLBACK = "cmdhub:"
@@ -56,6 +57,9 @@ class Module(BaseModule):
         self._start_wall = time.monotonic()
         self._command_favorites: list[str] = []
         self._palette_panels: set[tuple[int, int]] = set()
+        self._command_tokens: dict[str, tuple[str, str]] = {}
+        self._panel_views: dict[tuple[int, int], tuple[int, str, str]] = {}
+        self._category_tokens: dict[str, str] = {}
 
     async def on_load(self) -> None:
         level = await self.storage.get(self.NAMESPACE, "log_level", None)
@@ -83,6 +87,9 @@ class Module(BaseModule):
                 pass
             self._cb_handler = None
         self._palette_panels.clear()
+        self._command_tokens.clear()
+        self._panel_views.clear()
+        self._category_tokens.clear()
 
     # ------------------------- command index -------------------------
     def _rows(self) -> list[dict[str, Any]]:
@@ -178,31 +185,132 @@ class Module(BaseModule):
         ])
         return "\n".join(lines)[:4050]
 
+    def _command_token(self, module: str, command_name: str) -> str:
+        seed = f"{module}:{command_name}".encode("utf-8")
+        token = hashlib.sha1(seed).hexdigest()[:10]
+        self._command_tokens[token] = (module, command_name)
+        return token
+
+    def _category_token(self, category: str) -> str:
+        token = hashlib.sha1(str(category).encode("utf-8")).hexdigest()[:10]
+        self._category_tokens[token] = str(category)
+        return token
+
+    @staticmethod
+    def _token_payload(payload: str) -> str:
+        return str(payload or "").replace(":", "_")[:28]
+
     def _page_keyboard(self, rows: list[dict[str, Any]], page: int, *, mode: str, payload: str) -> InlineKeyboardMarkup:
         pages = max(1, (len(rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         page = max(1, min(page, pages))
-        def token(value: str) -> str:
-            return str(value).replace(":", "_")[:40]
-        key = f"{self.CMD_CALLBACK}{mode}:{page}:{token(payload)}"
-        buttons = []
+        buttons: list[list[InlineKeyboardButton]] = []
+        batch = rows[(page - 1) * self.PAGE_SIZE:page * self.PAGE_SIZE]
+        for row in batch:
+            token = self._command_token(row["module"], row["name"])
+            favorite = row["name"] in set(self._command_favorites)
+            star = "⭐" if favorite else "☆"
+            label = f"{self.get_prefix()}{row['name']}"
+            buttons.append([
+                InlineKeyboardButton(label[:30], callback_data=f"{self.CMD_CALLBACK}detail:{token}"),
+                InlineKeyboardButton(star, callback_data=f"{self.CMD_CALLBACK}fav:{token}"),
+            ])
+
         if mode == "all" and page == 1 and self._categories(rows):
             cats = self._categories(rows)[:6]
-            buttons.append([InlineKeyboardButton(f"📁 {cat}", callback_data=f"{self.CMD_CALLBACK}cat:{token(cat)}") for cat in cats[:3]])
-            if len(cats) > 3:
-                buttons.append([InlineKeyboardButton(f"📁 {cat}", callback_data=f"{self.CMD_CALLBACK}cat:{token(cat)}") for cat in cats[3:6]])
-        nav = []
+            for offset in range(0, len(cats), 3):
+                chunk = cats[offset:offset + 3]
+                buttons.append([
+                    InlineKeyboardButton(f"📁 {cat[:18]}", callback_data=f"{self.CMD_CALLBACK}cat:{self._category_token(cat)}")
+                    for cat in chunk
+                ])
+
+        nav: list[InlineKeyboardButton] = [
+            InlineKeyboardButton("⏮", callback_data=f"{self.CMD_CALLBACK}page:{mode}:1:{self._token_payload(payload)}"),
+        ]
         if page > 1:
-            nav.append(InlineKeyboardButton("⬅️", callback_data=f"{self.CMD_CALLBACK}page:{mode}:{page-1}:{token(payload)}"))
-        nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data=key))
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"{self.CMD_CALLBACK}page:{mode}:{page-1}:{self._token_payload(payload)}"))
+        nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data=f"{self.CMD_CALLBACK}noop"))
         if page < pages:
-            nav.append(InlineKeyboardButton("➡️", callback_data=f"{self.CMD_CALLBACK}page:{mode}:{page+1}:{token(payload)}"))
-        if nav:
-            buttons.append(nav)
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"{self.CMD_CALLBACK}page:{mode}:{page+1}:{self._token_payload(payload)}"))
+        nav.append(InlineKeyboardButton("⏭", callback_data=f"{self.CMD_CALLBACK}page:{mode}:{pages}:{self._token_payload(payload)}"))
+        buttons.append(nav)
         buttons.append([
-            InlineKeyboardButton("⭐ Favorites", callback_data=f"{self.CMD_CALLBACK}fav:1"),
-            InlineKeyboardButton("🏠 Refresh", callback_data=f"{self.CMD_CALLBACK}home"),
+            InlineKeyboardButton("⭐ Favorites", callback_data=f"{self.CMD_CALLBACK}favpage"),
+            InlineKeyboardButton("📁 Categories", callback_data=f"{self.CMD_CALLBACK}categories"),
         ])
         return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    async def _show_categories(self, message: Any) -> None:
+        categories = self._categories(self._rows())
+        buttons: list[list[InlineKeyboardButton]] = []
+        for offset in range(0, len(categories), 2):
+            chunk = categories[offset:offset + 2]
+            buttons.append([
+                InlineKeyboardButton(
+                    f"📁 {category[:20]}",
+                    callback_data=f"{self.CMD_CALLBACK}cat:{self._category_token(category)}",
+                )
+                for category in chunk
+            ])
+        buttons.append([InlineKeyboardButton("⬅️ Commands", callback_data=f"{self.CMD_CALLBACK}home")])
+        await message.edit_text(
+            f"📁 <b>Command Categories</b>\n\nВсего категорий: <b>{len(categories)}</b>\nВыбери раздел:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    async def _show_command_detail(self, message: Any, token: str) -> None:
+        pair = self._command_tokens.get(token)
+        if not pair:
+            await message.edit_text("⚠️ Эта команда уже неактуальна. Открой <code>.cmds</code> заново.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⌨️ Commands", callback_data=f"{self.CMD_CALLBACK}home")]]))
+            return
+        module_name, command_name = pair
+        row = next((r for r in self._rows() if r["module"] == module_name and r["name"] == command_name), None)
+        if row is None:
+            await message.edit_text("⚠️ Команда больше недоступна.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⌨️ Commands", callback_data=f"{self.CMD_CALLBACK}home")]]))
+            return
+        prefix = self.get_prefix()
+        fav = command_name in self._command_favorites
+        aliases = ", ".join(prefix + a for a in row["aliases"]) or "—"
+        text = (
+            f"⌨️ <b>{escape(prefix + command_name)}</b>\n\n"
+            f"Модуль: <code>{escape(module_name)}</code>\n"
+            f"Категория: <code>{escape(row['category'])}</code>\n"
+            f"Алиасы: <code>{escape(aliases)}</code>\n\n"
+            f"{escape(row['description'])}"
+        )
+        button_star = "⭐ Убрать из избранного" if fav else "☆ В избранное"
+        await message.edit_text(
+            text[:4050],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(button_star, callback_data=f"{self.CMD_CALLBACK}fav:{token}")],
+                [InlineKeyboardButton("⬅️ К списку", callback_data=f"{self.CMD_CALLBACK}back")],
+            ]),
+        )
+
+    async def _toggle_favorite_token(self, message: Any, token: str) -> None:
+        pair = self._command_tokens.get(token)
+        if not pair:
+            await message.edit_text("⚠️ Команда устарела. Открой <code>.cmds</code> заново.")
+            return
+        _module_name, command_name = pair
+        if command_name in self._command_favorites:
+            self._command_favorites.remove(command_name)
+        else:
+            self._command_favorites.append(command_name)
+            self._command_favorites = self._command_favorites[-30:]
+        await self.storage.set(self.NAMESPACE, "favorites", self._command_favorites)
+        view = self._panel_views.get((int(message.chat.id), int(message.id)), (1, "all", ""))
+        await self._render_page(message, view[0], view[1], view[2])
+
+    async def _render_page(self, message: Any, page: int, mode: str, payload: str) -> None:
+        rows = self._rows_for(mode, payload)
+        pages = max(1, (len(rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = max(1, min(page, pages))
+        self._panel_views[(int(message.chat.id), int(message.id))] = (page, mode, payload)
+        await message.edit_text(
+            self._page_text(rows, page, mode=mode, payload=payload),
+            reply_markup=self._page_keyboard(rows, page, mode=mode, payload=payload),
+        )
 
     def _rows_for(self, mode: str, payload: str) -> list[dict[str, Any]]:
         rows = self._rows()
@@ -224,11 +332,12 @@ class Module(BaseModule):
         """Компактный каталог команд: страницы, категории, поиск и избранное."""
         page, mode, payload = self._parse_cmds_args(ctx.raw_args)
         rows = self._rows_for(mode, payload)
-        await ctx.message.reply_text(
+        msg = await ctx.message.reply_text(
             self._page_text(rows, page, mode=mode, payload=payload, total=len(rows)),
             reply_markup=self._page_keyboard(rows, page, mode=mode, payload=payload),
             quote=True,
         )
+        self._panel_views[(int(msg.chat.id), int(msg.id))] = (max(1, page), mode, payload)
 
     @command("favcmd", aliases=("favoritecmd",), category="Core")
     async def favcmd(self, ctx: CommandContext) -> None:
@@ -281,24 +390,34 @@ class Module(BaseModule):
         data = str(query.data or "")
         try:
             if data == self.CMD_CALLBACK + "home":
-                rows = self._rows()
-                await message.edit_text(self._page_text(rows, 1, mode="all", payload=""), reply_markup=self._page_keyboard(rows, 1, mode="all", payload=""))
-            elif data == self.CMD_CALLBACK + "fav:1":
-                rows = self._rows_for("fav", "")
-                await message.edit_text(self._page_text(rows, 1, mode="fav", payload=""), reply_markup=self._page_keyboard(rows, 1, mode="fav", payload=""))
+                await self._render_page(message, 1, "all", "")
+            elif data == self.CMD_CALLBACK + "favpage":
+                await self._render_page(message, 1, "fav", "")
+            elif data == self.CMD_CALLBACK + "categories":
+                await self._show_categories(message)
+            elif data == self.CMD_CALLBACK + "noop":
+                await query.answer()
+                return
+            elif data == self.CMD_CALLBACK + "back":
+                view = self._panel_views.get((int(message.chat.id), int(message.id)), (1, "all", ""))
+                await self._render_page(message, view[0], view[1], view[2])
+            elif data.startswith(self.CMD_CALLBACK + "detail:"):
+                await self._show_command_detail(message, data.rsplit(":", 1)[1])
+            elif data.startswith(self.CMD_CALLBACK + "fav:"):
+                await self._toggle_favorite_token(message, data.rsplit(":", 1)[1])
             elif data.startswith(self.CMD_CALLBACK + "cat:"):
-                payload = data.rsplit(":", 1)[1]
-                rows = self._rows_for("category", payload)
-                await message.edit_text(self._page_text(rows, 1, mode="category", payload=payload), reply_markup=self._page_keyboard(rows, 1, mode="category", payload=payload))
+                token = data.rsplit(":", 1)[1]
+                payload = self._category_tokens.get(token)
+                if payload is None:
+                    await query.answer("Категория устарела. Открой .cmds заново.", show_alert=True)
+                    return
+                await self._render_page(message, 1, "category", payload)
             elif data.startswith(self.CMD_CALLBACK + "page:"):
                 parts = data.split(":", 4)
                 mode = parts[2]
                 page = max(1, int(parts[3]))
                 payload = parts[4] if len(parts) > 4 else ""
-                rows = self._rows_for(mode, payload)
-                pages = max(1, (len(rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
-                page = min(page, pages)
-                await message.edit_text(self._page_text(rows, page, mode=mode, payload=payload), reply_markup=self._page_keyboard(rows, page, mode=mode, payload=payload))
+                await self._render_page(message, page, mode, payload)
             await query.answer()
         except Exception as exc:
             self.loader.record_runtime_error(self.name, "command_callback", exc)
