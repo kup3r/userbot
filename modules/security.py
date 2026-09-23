@@ -71,11 +71,21 @@ class SecurityScanner(ast.NodeVisitor):
 
     IMPORT_DANGER = {
         "subprocess": ("CRITICAL", "Импорт subprocess позволяет запускать процессы."),
-        "ctypes": ("HIGH", "Импорт ctypes может выполнять нативный код."),
+        "ctypes": ("CRITICAL", "Импорт ctypes может выполнять нативный код."),
+        "multiprocessing": ("CRITICAL", "Импорт multiprocessing может создавать дочерние процессы."),
+        "signal": ("HIGH", "Импорт signal позволяет управлять сигналами процесса."),
+        "atexit": ("HIGH", "atexit может регистрировать код на завершение процесса."),
     }
 
     DANGER_CALLS = {
         ("os", "system"): (Severity.CRITICAL, "os.system() может выполнить shell-команду."),
+        ("os", "_exit"): (Severity.CRITICAL, "os._exit() мгновенно завершает worker."),
+        ("os", "kill"): (Severity.CRITICAL, "os.kill() может завершить worker."),
+        ("sys", "exit"): (Severity.CRITICAL, "sys.exit() может завершить worker."),
+        ("signal", "kill"): (Severity.CRITICAL, "signal.kill() может завершить worker."),
+        ("signal", "raise_signal"): (Severity.CRITICAL, "signal.raise_signal() может завершить worker."),
+        ("multiprocessing", "Process"): (Severity.HIGH, "Создание дочернего процесса из custom-модуля запрещено."),
+        ("atexit", "register"): (Severity.MEDIUM, "Регистрация shutdown hook усложняет безопасную выгрузку модуля."),
         ("os", "popen"): (Severity.CRITICAL, "os.popen() может выполнить shell-команду."),
         ("subprocess", "run"): (Severity.CRITICAL, "subprocess.run() запускает внешний процесс."),
         ("subprocess", "Popen"): (Severity.CRITICAL, "subprocess.Popen() запускает внешний процесс."),
@@ -86,6 +96,8 @@ class SecurityScanner(ast.NodeVisitor):
         ("builtins", "eval"): (Severity.CRITICAL, "eval() выполняет динамический Python-код."),
         ("builtins", "exec"): (Severity.CRITICAL, "exec() выполняет динамический Python-код."),
         ("builtins", "__import__"): (Severity.CRITICAL, "__import__() выполняет динамический импорт."),
+        ("builtins", "exit"): (Severity.CRITICAL, "exit() может завершить worker."),
+        ("builtins", "quit"): (Severity.CRITICAL, "quit() может завершить worker."),
     }
 
     NETWORK_FUNCS = {
@@ -269,10 +281,17 @@ class SecurityScanner(ast.NodeVisitor):
             )
         self.generic_visit(node)
 
+    def visit_Raise(self, node: ast.Raise) -> None:
+        if node.exc is not None:
+            text = ast.unparse(node.exc) if hasattr(ast, "unparse") else ""
+            if "SystemExit" in text or "KeyboardInterrupt" in text:
+                self._add(Severity.CRITICAL, "Process-level exception", "Модуль явно поднимает исключение, способное остановить worker.", node)
+        self.generic_visit(node)
+
     def visit_Call(self, node: ast.Call) -> None:
         name = self._call_name(node)
 
-        if name in {"eval", "exec", "__import__"}:
+        if name in {"eval", "exec", "__import__", "exit", "quit"}:
             fake_name = f"builtins.{name}"
             severity, detail = self.DANGER_CALLS[("builtins", name)]
             self._add(severity, "Опасный вызов", detail, node)

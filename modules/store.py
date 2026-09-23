@@ -1,249 +1,342 @@
-"""Hikka-style module store.
-
-Uses an optional HTTPS JSON index when configured; otherwise exposes a local
-built-in catalog so `.store` remains useful out of the box.
-"""
+"""Tenant-scoped module store with inline browsing and installation."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
-import os
 import time
 from html import escape
-from importlib import import_module
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from typing import Any
 
-from core.commands import CommandContext, command
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+
+from core.commands import CommandContext, callback, command
+from core.loader import LoaderError
 from core.module import BaseModule
 
 
 class Module(BaseModule):
     name = "Store"
-    description = "Каталог встроенных и удалённых модулей с HTTPS и SHA-256."
-    version = "3.0.1"
+    description = "Глобальный каталог модулей с публикацией администратором, версиями и inline-установкой."
+    version = "4.0.0"
     category = "Tools"
+    PAGE_SIZE = 6
 
-    INDEX_URL = os.getenv("MODULE_STORE_INDEX_URL", "").strip()
-    CACHE_TTL = 300
-    MAX_INDEX = 512 * 1024
-    MAX_MODULE = 2 * 1024 * 1024
+    def __init__(self, app: Any, loader: Any, storage: Any) -> None:
+        super().__init__(app, loader, storage)
+        self._state: dict[str, tuple[str, str, float]] = {}
 
-    @command("store", category="Tools")
+    async def on_unload(self) -> None:
+        self._state.clear()
+
+    @command("store", aliases=("shop",), category="Tools")
     async def store(self, ctx: CommandContext) -> None:
-        """Каталог модулей: list/search/info/install/uninstall/refresh."""
-        try:
-            args = ctx.raw_args.strip().split(maxsplit=2)
-            action = args[0].lower() if args else "list"
-            if action == "refresh":
-                items = await self._load_index(force=True)
-                await self._list(ctx, items, "🔄 <b>Store refreshed</b>")
+        parts = ctx.raw_args.strip().split(maxsplit=2)
+        action = parts[0].lower() if parts else "list"
+        if action in {"install", "enable"}:
+            if len(parts) < 2:
+                await self._list(ctx.message, 1, "")
                 return
-            items = await self._load_index(force=False)
-            if action in {"list", "ls"}:
-                await self._list(ctx, items)
-                return
-            if action == "search":
-                query = args[1].casefold() if len(args) > 1 else ""
-                matches = [x for x in items if self._matches(x, query)]
-                await self._list(ctx, matches[:50], f"🔎 <b>Store Search</b> · <code>{escape(query)}</code>")
-                return
-            if action in {"info", "show"}:
-                if len(args) < 2:
-                    raise ValueError("Использование: .store info module")
-                await self._info(ctx, items, args[1])
-                return
-            if action in {"install", "enable"}:
-                if len(args) < 2:
-                    raise ValueError("Использование: .store install module")
-                await self._install(ctx, items, args[1])
-                return
-            if action in {"uninstall", "disable", "remove"}:
-                if len(args) < 2:
-                    raise ValueError("Использование: .store uninstall module")
-                ok = await self.loader.disable_module(args[1])
-                await ctx.message.reply_text(f"{'✅' if ok else '❌'} <code>{escape(args[1])}</code> {'отключён' if ok else 'не найден'}.")
-                return
-            raise ValueError("Использование: .store | search | info | install | uninstall | refresh")
-        except Exception as exc:
-            await ctx.message.reply_text(f"❌ Store: <code>{escape(type(exc).__name__)}: {escape(str(exc))}</code>")
-
-    async def _load_index(self, *, force: bool = False) -> list[dict]:
-        cached = await self.get("index", {})
-        now = time.time()
-        if not force and isinstance(cached, dict) and now - float(cached.get("updated_at", 0)) < self.CACHE_TTL:
-            items = cached.get("items")
-            if isinstance(items, list) and items:
-                return [x for x in items if isinstance(x, dict)]
-        if self.INDEX_URL:
-            try:
-                raw = await asyncio.to_thread(self._fetch, self.INDEX_URL, self.MAX_INDEX)
-                data = json.loads(raw.decode("utf-8"))
-                payload = data.get("modules", data) if isinstance(data, dict) else data
-                items = self._clean_remote(payload)
-                if items:
-                    await self.set("index", {"updated_at": now, "items": items})
-                    return items
-            except Exception:
-                # Remote store is optional. Fall back to local catalog instead of breaking `.store`.
-                pass
-        items = self._builtin_catalog()
-        try:
-            published = await self.storage.list_store_modules()
-        except Exception:
-            published = []
-        for row in published:
-            item = dict(row)
-            item["name"] = str(item.get("module_name") or item.get("name") or "").lower()
-            item["builtin"] = False
-            item["store_db"] = True
-            item["source_blob"] = item.get("source", b"")
-            item.pop("source", None)
-            if not isinstance(item.get("requirements"), list):
-                item["requirements"] = []
-            items = [x for x in items if str(x.get("name", "")).lower() != item["name"]]
-            items.append(item)
-        items.sort(key=lambda x: (str(x.get("category", "General")).lower(), str(x.get("name", "")).lower()))
-        await self.set("index", {"updated_at": now, "items": items})
-        return items
-
-    def _builtin_catalog(self) -> list[dict]:
-        package = import_module("modules")
-        names = []
-        for path in package.__path__:
-            import pathlib
-            for file in pathlib.Path(path).glob("*.py"):
-                name = file.stem
-                if name not in {"__init__", "store"} and not name.startswith("_"):
-                    names.append(name.lower())
-        items: list[dict] = []
-        for name in sorted(set(names)):
-            try:
-                mod = import_module(f"modules.{name}")
-                cls = getattr(mod, "Module", None)
-                if not isinstance(cls, type):
-                    continue
-                items.append({
-                    "name": name,
-                    "version": str(getattr(cls, "version", "1.0.0")),
-                    "author": ", ".join(map(str, getattr(cls, "authors", ()) or ("Nexus",))),
-                    "description": str(getattr(cls, "description", "Без описания.")),
-                    "category": str(getattr(cls, "category", "General")),
-                    "builtin": True,
-                    "direct_url": "",
-                })
-            except Exception:
-                continue
-        return items
-
-    @staticmethod
-    def _clean_remote(payload: object) -> list[dict]:
-        if not isinstance(payload, list):
-            return []
-        clean: list[dict] = []
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip().lower()
-            direct_url = str(item.get("direct_url", "")).strip()
-            if not name:
-                continue
-            if direct_url:
-                parsed = urlparse(direct_url)
-                if parsed.scheme != "https" or not parsed.netloc:
-                    continue
-            clean.append(dict(item))
-        return clean
-
-    @staticmethod
-    def _matches(item: dict, query: str) -> bool:
-        if not query:
-            return True
-        return any(query in str(item.get(key, "")).casefold() for key in ("name", "description", "category", "author", "version"))
-
-    async def _list(self, ctx: CommandContext, items: list[dict], title: str = "🛒 <b>Module Store</b>") -> None:
-        if not items:
-            await ctx.message.reply_text("📭 Store пуст.")
+            await self._install(ctx.message, parts[1])
             return
-        lines = [title, f"Доступно: <b>{len(items)}</b>", ""]
-        for item in items[:24]:
-            state = "✅" if str(item.get("name", "")).lower() in self.loader.enabled_modules else "○"
-            origin = "builtin" if item.get("builtin") else ("Nexus" if item.get("store_db") else "remote")
-            lines.append(
-                f"{state} <code>{escape(str(item.get('name', '?')))}</code> · "
-                f"<i>{escape(str(item.get('category', 'General')))}</i> · "
-                f"{escape(str(item.get('version', '—')))} · <code>{origin}</code>"
-            )
-            lines.append(f"   {escape(str(item.get('description', 'Без описания'))[:110])}")
-        lines.extend(["", f"<code>{escape(self.get_prefix())}store info name</code>", f"<code>{escape(self.get_prefix())}store install name</code>"])
-        await ctx.message.reply_text("\n".join(lines)[:4050])
+        if action in {"update", "upgrade"}:
+            if len(parts) < 2:
+                await ctx.message.reply_text("Использование: <code>.store update module</code>")
+                return
+            await self._install(ctx.message, parts[1], force_update=True)
+            return
+        if action in {"uninstall", "disable", "remove"}:
+            if len(parts) < 2:
+                await ctx.message.reply_text("Использование: <code>.store uninstall module</code>")
+                return
+            try:
+                ok = await self.loader.disable_module(parts[1])
+                await ctx.message.reply_text(f"{'✅' if ok else '⚠️'} <code>{escape(parts[1])}</code>: {'отключён' if ok else 'не найден'}.", quote=True)
+            except Exception as exc:
+                await ctx.message.reply_text(f"❌ <code>{escape(type(exc).__name__)}: {escape(str(exc))}</code>", quote=True)
+            return
+        if action in {"info", "show"}:
+            if len(parts) < 2:
+                await ctx.message.reply_text("Использование: <code>.store info module</code>")
+                return
+            await self._info(ctx.message, parts[1])
+            return
+        if action == "search":
+            query = parts[1].casefold() if len(parts) > 1 else ""
+            await self._list(ctx.message, 1, query, heading=f"🔎 <b>Store</b> · {escape(query)}")
+            return
+        if action in {"versions", "history"}:
+            if len(parts) < 2:
+                await ctx.message.reply_text("Использование: <code>.store versions module</code>")
+                return
+            rows = await self.storage.get_store_module(parts[1])
+            if not rows:
+                await ctx.message.reply_text("❌ Модуль не найден.")
+                return
+            versions = await self.storage.list_store_versions(parts[1], 10)
+            lines = [f"🗂 <b>Store History</b> · <code>{escape(parts[1].lower())}</code>", ""]
+            if not versions:
+                lines.append("Старых версий нет.")
+            for i, item in enumerate(versions, 1):
+                stamp=time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(item.get("created_at") or 0)))
+                lines.append(f"#{i} · v{escape(str(item.get('version') or '—'))} · {stamp}")
+            await ctx.message.reply_text("\n".join(lines)[:3900])
+            return
+        if action == "refresh":
+            await ctx.message.reply_text("✅ Каталог читается из PostgreSQL в реальном времени.")
+            await self._list(ctx.message, 1, "")
+            return
+        await self._list(ctx.message, 1, "")
 
-    async def _info(self, ctx: CommandContext, items: list[dict], name: str) -> None:
-        item = next((x for x in items if str(x.get("name", "")).lower() == name.lower()), None)
-        if not item:
-            raise ValueError("Модуль не найден в каталоге.")
-        lines = [
-            "📦 <b>Module Store</b>", "",
-            f"Имя: <code>{escape(str(item.get('name')))}</code>",
-            f"Версия: <code>{escape(str(item.get('version', '—')))}</code>",
-            f"Категория: <code>{escape(str(item.get('category', 'General')))}</code>",
-            f"Автор: <code>{escape(str(item.get('author', '—')))}</code>",
-            f"Описание: {escape(str(item.get('description', '—')))}",
-            f"Состояние: <code>{'enabled' if str(item.get('name')).lower() in self.loader.enabled_modules else 'disabled'}</code>",
-            f"Источник: <code>{'builtin' if item.get('builtin') else 'HTTPS'}</code>",
-        ]
-        if item.get("sha256"):
-            lines.append(f"SHA-256: <code>{escape(str(item.get('sha256')))}</code>")
-        await ctx.message.reply_text("\n".join(lines)[:4050])
+    def _builtin_catalog(self) -> list[dict[str, Any]]:
+        """Compatibility helper used by older deployments/tests."""
+        from importlib import import_module
+        from pathlib import Path
+        result: list[dict[str, Any]] = []
+        try:
+            pkg = import_module("modules")
+            names: list[str] = []
+            for base in pkg.__path__:
+                names.extend(p.stem for p in Path(base).glob("*.py") if p.stem not in {"__init__", "store"} and not p.stem.startswith("_"))
+            for name in sorted(set(names)):
+                try:
+                    mod = import_module(f"modules.{name}")
+                    cls = getattr(mod, "Module", None)
+                    if not isinstance(cls, type):
+                        continue
+                    result.append({
+                        "name": name.lower(),
+                        "version": str(getattr(cls, "version", "1.0.0")),
+                        "author": ", ".join(map(str, getattr(cls, "authors", ()) or ("Nexus",))),
+                        "description": str(getattr(cls, "description", "Без описания.")),
+                        "category": str(getattr(cls, "category", "General")),
+                        "builtin": True,
+                        "direct_url": "",
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return result
 
-    async def _install(self, ctx: CommandContext, items: list[dict], name: str) -> None:
-        item = next((x for x in items if str(x.get("name", "")).lower() == name.lower()), None)
-        if not item:
-            raise ValueError("Модуль не найден.")
-        target = str(item.get("name", "")).lower()
-        if target in self.loader.loaded:
-            await ctx.message.reply_text(f"✅ <code>{escape(target)}</code> уже загружен.")
+    async def _catalog(self) -> list[dict[str, Any]]:
+        builtin: list[dict[str, Any]] = []
+        try:
+            from importlib import import_module
+            from pathlib import Path
+            pkg = import_module("modules")
+            names: list[str] = []
+            for base in pkg.__path__:
+                names.extend(p.stem for p in Path(base).glob("*.py") if p.stem not in {"__init__", "store"} and not p.stem.startswith("_"))
+            for name in sorted(set(names)):
+                try:
+                    mod = import_module(f"modules.{name}")
+                    cls = getattr(mod, "Module", None)
+                    if not isinstance(cls, type):
+                        continue
+                    builtin.append({
+                        "name": name.lower(),
+                        "filename": f"{name}.py",
+                        "version": str(getattr(cls, "version", "1.0.0")),
+                        "author": ", ".join(map(str, getattr(cls, "authors", ()) or ("Nexus",))),
+                        "description": str(getattr(cls, "description", "Без описания.")),
+                        "category": str(getattr(cls, "category", "General")),
+                        "sha256": "",
+                        "builtin": True,
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        global_rows = []
+        try:
+            global_rows = await self.storage.list_store_modules()
+        except Exception:
+            global_rows = []
+        merged = {str(item["name"]).lower(): item for item in builtin}
+        for row in global_rows:
+            name = str(row.get("name") or "").lower()
+            if not name or name in merged:
+                continue
+            merged[name] = {
+                "name": name,
+                "filename": str(row.get("filename") or f"{name}.py"),
+                "version": str(row.get("version") or "1.0.0"),
+                "author": str(row.get("author") or "Nexus"),
+                "description": str(row.get("description") or "Без описания."),
+                "category": str(row.get("category") or "General"),
+                "sha256": str(row.get("sha256") or ""),
+                "builtin": False,
+                "source": bytes(row.get("source") or b""),
+            }
+        return sorted(merged.values(), key=lambda x: (str(x["category"]).casefold(), str(x["name"]).casefold()))
+
+    async def _list(self, message: Any, page: int, query: str, heading: str = "🛒 <b>Module Store</b>") -> None:
+        items = await self._catalog()
+        if query:
+            items = [x for x in items if query in str(x["name"]).casefold() or query in str(x["description"]).casefold() or query in str(x["category"]).casefold() or query in str(x["author"]).casefold()]
+        pages = max(1, (len(items) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = max(1, min(int(page), pages))
+        batch = items[(page - 1) * self.PAGE_SIZE:page * self.PAGE_SIZE]
+        lines = [heading, f"Страница <b>{page}/{pages}</b> · модулей <b>{len(items)}</b>", ""]
+        for item in batch:
+            state = "✅" if str(item["name"]) in self.loader.loaded else "○"
+            origin = "builtin" if item.get("builtin") else "community"
+            lines.append(f"{state} <code>{escape(str(item['name']))}</code> · <i>{escape(str(item['category']))}</i> · v{escape(str(item['version']))} · <code>{origin}</code>")
+            lines.append(f"  {escape(str(item['description'])[:100])}")
+        token = self._new_state("list", query)
+        buttons: list[list[InlineKeyboardButton]] = []
+        for item in batch:
+            info_token = self._new_state("info", str(item["name"]))
+            install_token = self._new_state("install", str(item["name"]))
+            buttons.append([
+                InlineKeyboardButton(f"ℹ️ {str(item['name'])[:22]}", callback_data=f"storehub:i:{info_token}"),
+                InlineKeyboardButton("📥", callback_data=f"storehub:x:{install_token}"),
+            ])
+        nav: list[InlineKeyboardButton] = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"storehub:p:{token}:{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data=f"storehub:n:{token}:{page}"))
+        if page < pages:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"storehub:p:{token}:{page+1}"))
+        buttons.append(nav)
+        buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"storehub:r:{token}:1"), InlineKeyboardButton("🏠 Store", callback_data=f"storehub:h:{self._new_state('list','')}:1")])
+        await message.reply_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), quote=True)
+
+    async def _info(self, message: Any, name: str) -> None:
+        item = next((x for x in await self._catalog() if x["name"] == name.lower()), None)
+        if item is None:
+            await message.reply_text("❌ Модуль не найден в Store.")
+            return
+        state = "загружен" if name.lower() in self.loader.loaded else "не загружен"
+        changelog = ""
+        if isinstance(item.get("metadata"), dict):
+            changelog = str(item["metadata"].get("changelog") or "")
+        text = (
+            "📦 <b>Module Store</b>\n\n"
+            f"Имя: <code>{escape(str(item['name']))}</code>\n"
+            f"Версия: <code>{escape(str(item['version']))}</code>\n"
+            f"Автор: <code>{escape(str(item['author']))}</code>\n"
+            f"Категория: <code>{escape(str(item['category']))}</code>\n"
+            f"Источник: <code>{'builtin' if item.get('builtin') else 'community'}</code>\n"
+            f"Состояние: <b>{state}</b>\n\n"
+            f"{escape(str(item['description']))}"
+            + (f"\n\n📝 <b>Changelog</b>\n{escape(changelog[:700])}" if changelog else "")
+        )
+        buttons = [[InlineKeyboardButton("📥 Установить / обновить", callback_data=f"storehub:x:{self._new_state('install', name)}")], [InlineKeyboardButton("🗂 Версии", callback_data=f"storehub:v:{self._new_state('versions', name)}")], [InlineKeyboardButton("◀️ Store", callback_data=f"storehub:h:{self._new_state('list','')}:1")]]
+        await message.reply_text(text[:3900], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), quote=True)
+
+    async def _install(self, message: Any, name: str, force_update: bool = False) -> None:
+        name = name.lower().removesuffix(".py")
+        item = next((x for x in await self._catalog() if x["name"] == name), None)
+        if item is None:
+            await message.reply_text("❌ Модуль не найден в Store.")
             return
         if item.get("builtin"):
-            ok = await self.loader.enable_module(target)
-            if not ok:
-                raise ValueError("Не удалось включить встроенный модуль. Проверь лимиты тарифа и зависимости.")
-            await ctx.message.reply_text(f"✅ Встроенный модуль <code>{escape(target)}</code> включён.")
+            try:
+                ok = await self.loader.enable_module(name)
+            except Exception as exc:
+                await message.reply_text(f"❌ <code>{escape(type(exc).__name__)}: {escape(str(exc))}</code>", quote=True)
+                return
+            await message.reply_text(f"{'✅' if ok else '⚠️'} <code>{escape(name)}</code>: {'включён' if ok else 'не загружен'}", quote=True)
             return
-        if item.get("store_db"):
-            stored = await self.storage.get_store_module(target)
-            if not stored:
-                raise ValueError("Запись модуля исчезла из магазина. Выполни .store refresh.")
-            raw = bytes(stored.get("source", b""))
-            expected = str(stored.get("sha256", "")).strip().lower()
-            if expected and hashlib.sha256(raw).hexdigest().lower() != expected:
-                raise ValueError("SHA-256 модуля в магазине не совпадает с исходником. Установка остановлена.")
-            installed, _ = await self.loader.install_source(raw, f"{target}.py", source_url=f"store:{target}")
-            await self.storage.increment_store_downloads(target)
-            await ctx.message.reply_text(f"✅ Установлен из Nexus Store: <code>{escape(installed)}</code>.")
+        source = bytes(item.get("source") or b"")
+        expected = str(item.get("sha256") or "").lower()
+        actual = hashlib.sha256(source).hexdigest().lower()
+        if expected and expected != actual:
+            await message.reply_text("⛔ SHA-256 опубликованного модуля не совпал. Установка остановлена.", quote=True)
             return
-        direct_url = str(item.get("direct_url", "")).strip()
-        if not direct_url:
-            raise ValueError("У удалённого модуля нет direct_url.")
-        raw = await asyncio.to_thread(self._fetch, direct_url, self.MAX_MODULE)
-        expected = str(item.get("sha256", "")).strip().lower()
-        if expected:
-            actual = hashlib.sha256(raw).hexdigest().lower()
-            if actual != expected:
-                raise ValueError("SHA-256 модуля не совпадает с индексом. Установка остановлена.")
-        installed, _ = await self.loader.install_source(raw, f"{target}.py", source_url=direct_url)
-        await ctx.message.reply_text(f"✅ Установлен <code>{escape(installed)}</code>.")
+        if name in self.loader.loaded and not force_update:
+            await message.reply_text(f"✅ <code>{escape(name)}</code> уже загружен. Для новой версии используй <code>.store update {escape(name)}</code>.", quote=True)
+            return
+        try:
+            installed, _meta = await self.loader.install_source(source, f"{name}.py", source_url=f"store:{name}")
+        except Exception as exc:
+            await message.reply_text(f"❌ Store install: <code>{escape(type(exc).__name__)}: {escape(str(exc))}</code>", quote=True)
+            return
+        await message.reply_text(f"✅ Store: <code>{escape(installed)}</code> установлен/обновлён.", quote=True)
 
-    @staticmethod
-    def _fetch(url: str, limit: int) -> bytes:
-        parsed = urlparse(url)
-        if parsed.scheme != "https":
-            raise ValueError("Store допускает только HTTPS.")
-        req = Request(url, headers={"User-Agent": "NexusUserbotStore/12.0"})
-        with urlopen(req, timeout=20) as response:
-            data = response.read(limit + 1)
-        if len(data) > limit:
-            raise ValueError("Ответ слишком большой.")
-        return data
+    def _new_state(self, action: str, payload: str) -> str:
+        token = hashlib.sha256(f"{time.time_ns()}:{action}:{payload}".encode()).hexdigest()[:8]
+        self._state[token] = (action, payload, time.time() + 1800)
+        for key, value in list(self._state.items()):
+            if value[2] < time.time():
+                self._state.pop(key, None)
+        return token
+
+    @callback(r"^storehub:", group=92, owner_only=True)
+    async def _store_callback(self, query: CallbackQuery, _match: Any) -> None:
+        msg = query.message
+        if msg is None:
+            await query.answer("Сообщение недоступно.", show_alert=True)
+            return
+        try:
+            parts = str(query.data or "").split(":")
+            action = parts[1]
+            token = parts[2]
+            state = self._state.get(token)
+            if not state or state[2] < time.time():
+                raise RuntimeError("Кнопка устарела. Выполни .store ещё раз.")
+            if action in {"p", "n", "r", "h"}:
+                page = int(parts[3]) if len(parts) > 3 else 1
+                await self._edit_list(msg, page, state[1])
+            elif action == "i":
+                await self._edit_info(msg, state[1])
+            elif action == "x":
+                await self._install(msg, state[1], force_update=True)
+            elif action == "v":
+                versions = await self.storage.list_store_versions(state[1], 10)
+                lines=[f"🗂 <b>Store History</b> · <code>{escape(state[1])}</code>", ""]
+                if not versions:
+                    lines.append("Старых версий нет.")
+                for i, item in enumerate(versions,1):
+                    stamp=time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(item.get("created_at") or 0)))
+                    lines.append(f"#{i} · v{escape(str(item.get('version') or '—'))} · {stamp}")
+                lines.append("")
+                lines.append("Новая публикация администратором автоматически сохраняет предыдущую версию.")
+                await msg.edit_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("◀️ Module", callback_data=f"storehub:i:{self._new_state('info',state[1])}")]]))
+            else:
+                raise RuntimeError("Неизвестное действие.")
+            await query.answer()
+        except Exception as exc:
+            await query.answer(f"Ошибка: {type(exc).__name__}", show_alert=True)
+
+    async def _edit_list(self, message: Any, page: int, query: str) -> None:
+        items = await self._catalog()
+        if query:
+            items = [x for x in items if query in str(x["name"]).casefold() or query in str(x["description"]).casefold() or query in str(x["category"]).casefold()]
+        pages = max(1, (len(items) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = max(1, min(page, pages))
+        batch = items[(page-1)*self.PAGE_SIZE:page*self.PAGE_SIZE]
+        lines = ["🛒 <b>Module Store</b>", f"Страница <b>{page}/{pages}</b> · модулей <b>{len(items)}</b>", ""]
+        for item in batch:
+            state = "✅" if str(item["name"]) in self.loader.loaded else "○"
+            lines.append(f"{state} <code>{escape(str(item['name']))}</code> · v{escape(str(item['version']))} · {escape(str(item['category']))}")
+            lines.append(f"  {escape(str(item['description'])[:100])}")
+        token = self._new_state("list", query)
+        buttons = [[
+            InlineKeyboardButton(f"ℹ️ {str(x['name'])[:22]}", callback_data=f"storehub:i:{self._new_state('info', str(x['name']))}"),
+            InlineKeyboardButton("📥", callback_data=f"storehub:x:{self._new_state('install', str(x['name']))}"),
+        ] for x in batch]
+        nav=[]
+        if page>1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"storehub:p:{token}:{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data=f"storehub:n:{token}:{page}"))
+        if page<pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"storehub:p:{token}:{page+1}"))
+        buttons.append(nav)
+        buttons.append([InlineKeyboardButton("🔄", callback_data=f"storehub:r:{token}:1"), InlineKeyboardButton("🏠", callback_data=f"storehub:h:{token}:1")])
+        await message.edit_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+    async def _edit_info(self, message: Any, name: str) -> None:
+        item = next((x for x in await self._catalog() if x["name"] == name.lower()), None)
+        if item is None:
+            await message.edit_text("❌ Модуль не найден.")
+            return
+        text = (
+            "📦 <b>Store Module</b>\n\n"
+            f"<b>{escape(str(item['name']))}</b> · v{escape(str(item['version']))}\n"
+            f"Автор: <code>{escape(str(item['author']))}</code>\n"
+            f"Категория: <code>{escape(str(item['category']))}</code>\n\n"
+            f"{escape(str(item['description']))}"
+        )
+        buttons = [[InlineKeyboardButton("📥 Установить / обновить", callback_data=f"storehub:x:{self._new_state('install', name)}")], [InlineKeyboardButton("◀️ Store", callback_data=f"storehub:h:{self._new_state('list','')}:1")]]
+        await message.edit_text(text[:3900], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))

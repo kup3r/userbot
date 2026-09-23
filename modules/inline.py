@@ -25,7 +25,7 @@ from core.utils import format_uptime
 class Module(BaseModule):
     name = "Inline Dashboard"
     description = "Нативная интерактивная панель управления в стиле современных modular userbots."
-    version = "12.0.1"
+    version = "12.2.0"
     category = "Core"
     command_group = 90
 
@@ -691,7 +691,7 @@ class Module(BaseModule):
         plan = str(getattr(self.loader.config, "plan", "single"))
         return (
             "🤖 <b>NEXUS USERBOT</b>\n"
-            "<code>v12.0.1 · modular runtime</code>\n\n"
+            "<code>v12.2.0 · modular runtime</code>\n\n"
             f"🧩 Modules  <b>{len(loaded)}</b>\n"
             f"⌨️ Commands <b>{commands}</b>\n"
             f"👁 Watchers <b>{watchers}</b>\n"

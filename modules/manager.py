@@ -11,11 +11,12 @@ import asyncio
 import logging
 import platform
 import time
+import contextlib
+import secrets
 from collections import deque
 from html import escape
 from typing import Any
 
-from pyrogram.handlers import CallbackQueryHandler
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.commands import CommandContext, callback, command
@@ -41,7 +42,7 @@ class ErrorBufferHandler(logging.Handler):
 class Module(BaseModule):
     name = "Manager"
     description = "Command hub, paginated help, favorites, runtime statistics and error buffer."
-    version = "12.0.1"
+    version = "12.2.0"
     category = "Core"
     NAMESPACE = "manager"
     CMD_CALLBACK = "cmdhub:"
@@ -51,7 +52,7 @@ class Module(BaseModule):
         super().__init__(app, loader, storage)
         self.error_buffer: deque[str] = deque(maxlen=60)
         self._log_handler: ErrorBufferHandler | None = None
-        self._cb_handler: tuple[Any, int] | None = None
+        self._palette_state: dict[str, tuple[str, str, float]] = {}
         self._start_process_cpu = time.process_time()
         self._start_wall = time.monotonic()
         self._command_favorites: list[str] = []
@@ -66,22 +67,12 @@ class Module(BaseModule):
             self._command_favorites = [str(x).lower().lstrip(self.get_prefix()) for x in favorites if str(x).strip()]
         self._log_handler = ErrorBufferHandler(self.error_buffer)
         logging.getLogger().addHandler(self._log_handler)
-        from pyrogram import filters
-        self._cb_handler = self.app.add_handler(
-            CallbackQueryHandler(self._command_callback, filters.regex(r"^cmdhub:")),
-            group=91,
-        )
 
     async def on_unload(self) -> None:
         if self._log_handler is not None:
             logging.getLogger().removeHandler(self._log_handler)
             self._log_handler = None
-        if self._cb_handler is not None:
-            try:
-                self.app.remove_handler(*self._cb_handler)
-            except Exception:
-                pass
-            self._cb_handler = None
+        self._palette_state.clear()
         self._palette_panels.clear()
 
     # ------------------------- command index -------------------------
@@ -178,29 +169,59 @@ class Module(BaseModule):
         ])
         return "\n".join(lines)[:4050]
 
-    def _page_keyboard(self, rows: list[dict[str, Any]], page: int, *, mode: str, payload: str) -> InlineKeyboardMarkup:
+    def _new_palette_token(self, mode: str, payload: str) -> str:
+        token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+        self._palette_state[token] = (mode, payload, time.time() + 1800)
+        now = time.time()
+        for key, value in list(self._palette_state.items()):
+            if value[2] < now:
+                self._palette_state.pop(key, None)
+        return token
+
+    def _command_token(self, row: dict[str, Any]) -> str:
+        token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+        self._palette_state[token] = ("command", str(row["module"]) + "|" + str(row["name"]), time.time() + 1800)
+        return token
+
+    def _keyboard_rows(self, rows: list[dict[str, Any]]) -> list[list[InlineKeyboardButton]]:
+        buttons: list[InlineKeyboardButton] = []
+        for row in rows:
+            token = self._command_token(row)
+            label = f"{self.get_prefix()}{row['name']}"
+            if len(label) > 25:
+                label = label[:24] + "…"
+            buttons.append(InlineKeyboardButton(label, callback_data=f"{self.CMD_CALLBACK}info:{token}"))
+        return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
+    def _page_keyboard(
+        self,
+        rows: list[dict[str, Any]],
+        page: int,
+        *,
+        mode: str,
+        payload: str,
+        token: str | None = None,
+    ) -> InlineKeyboardMarkup:
         pages = max(1, (len(rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         page = max(1, min(page, pages))
-        def token(value: str) -> str:
-            return str(value).replace(":", "_")[:40]
-        key = f"{self.CMD_CALLBACK}{mode}:{page}:{token(payload)}"
-        buttons = []
-        if mode == "all" and page == 1 and self._categories(rows):
-            cats = self._categories(rows)[:6]
-            buttons.append([InlineKeyboardButton(f"📁 {cat}", callback_data=f"{self.CMD_CALLBACK}cat:{token(cat)}") for cat in cats[:3]])
-            if len(cats) > 3:
-                buttons.append([InlineKeyboardButton(f"📁 {cat}", callback_data=f"{self.CMD_CALLBACK}cat:{token(cat)}") for cat in cats[3:6]])
-        nav = []
+        token = token or self._new_palette_token(mode, payload)
+        buttons: list[list[InlineKeyboardButton]] = []
+        batch = rows[(page - 1) * self.PAGE_SIZE: page * self.PAGE_SIZE]
+        buttons.extend(self._keyboard_rows(batch))
+        nav: list[InlineKeyboardButton] = []
         if page > 1:
-            nav.append(InlineKeyboardButton("⬅️", callback_data=f"{self.CMD_CALLBACK}page:{mode}:{page-1}:{token(payload)}"))
-        nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data=key))
+            nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"{self.CMD_CALLBACK}page:{token}:{page-1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page}/{pages}", callback_data=f"{self.CMD_CALLBACK}noop:{token}:{page}"))
         if page < pages:
-            nav.append(InlineKeyboardButton("➡️", callback_data=f"{self.CMD_CALLBACK}page:{mode}:{page+1}:{token(payload)}"))
-        if nav:
-            buttons.append(nav)
+            nav.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"{self.CMD_CALLBACK}page:{token}:{page+1}"))
+        buttons.append(nav)
         buttons.append([
-            InlineKeyboardButton("⭐ Favorites", callback_data=f"{self.CMD_CALLBACK}fav:1"),
-            InlineKeyboardButton("🏠 Refresh", callback_data=f"{self.CMD_CALLBACK}home"),
+            InlineKeyboardButton("⭐ Избранное", callback_data=f"{self.CMD_CALLBACK}fav:{self._new_palette_token('fav','')}"),
+            InlineKeyboardButton("📁 Категории", callback_data=f"{self.CMD_CALLBACK}cats:{self._new_palette_token('all','')}"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("🔎 Как искать", callback_data=f"{self.CMD_CALLBACK}tip:{self._new_palette_token('all','')}"),
+            InlineKeyboardButton("🔄 Обновить", callback_data=f"{self.CMD_CALLBACK}refresh:{self._new_palette_token(mode,payload)}"),
         ])
         return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -221,7 +242,7 @@ class Module(BaseModule):
 
     @command("commands", aliases=("cmds", "cmd"), category="Core")
     async def commands(self, ctx: CommandContext) -> None:
-        """Компактный каталог команд: страницы, категории, поиск и избранное."""
+        """Компактный каталог команд с полноценной inline-навигацией."""
         page, mode, payload = self._parse_cmds_args(ctx.raw_args)
         rows = self._rows_for(mode, payload)
         await ctx.message.reply_text(
@@ -258,10 +279,6 @@ class Module(BaseModule):
             else:
                 await ctx.message.reply_text("⭐ Такой команды нет в избранном.", quote=True)
             return
-        favs = set(self._command_favorites)
-        if not favs:
-            await ctx.message.reply_text(f"⭐ Избранное пусто.\nИспользуй <code>{escape(self.get_prefix())}favcmd add ping</code>.", quote=True)
-            return
         rows = self._rows_for("fav", "")
         await ctx.message.reply_text(
             self._page_text(rows, 1, mode="fav", payload=""),
@@ -269,43 +286,91 @@ class Module(BaseModule):
             quote=True,
         )
 
-    async def _command_callback(self, _client: Any, query: CallbackQuery) -> None:
-        actor_id = int(getattr(getattr(query, "from_user", None), "id", 0) or 0)
-        if actor_id != int(getattr(self.loader, "tenant_id", 0) or 0):
-            await query.answer("⛔ Только владельцу.", show_alert=True)
-            return
+    @callback(r"^cmdhub:", group=91, owner_only=True)
+    async def _command_callback(self, query: CallbackQuery, _match: Any) -> None:
         message = query.message
         if message is None:
             await query.answer("Сообщение недоступно.", show_alert=True)
             return
-        data = str(query.data or "")
+        data = str(query.data or "").split(":")
         try:
-            if data == self.CMD_CALLBACK + "home":
-                rows = self._rows()
-                await message.edit_text(self._page_text(rows, 1, mode="all", payload=""), reply_markup=self._page_keyboard(rows, 1, mode="all", payload=""))
-            elif data == self.CMD_CALLBACK + "fav:1":
-                rows = self._rows_for("fav", "")
-                await message.edit_text(self._page_text(rows, 1, mode="fav", payload=""), reply_markup=self._page_keyboard(rows, 1, mode="fav", payload=""))
-            elif data.startswith(self.CMD_CALLBACK + "cat:"):
-                payload = data.rsplit(":", 1)[1]
-                rows = self._rows_for("category", payload)
-                await message.edit_text(self._page_text(rows, 1, mode="category", payload=payload), reply_markup=self._page_keyboard(rows, 1, mode="category", payload=payload))
-            elif data.startswith(self.CMD_CALLBACK + "page:"):
-                parts = data.split(":", 4)
-                mode = parts[2]
-                page = max(1, int(parts[3]))
-                payload = parts[4] if len(parts) > 4 else ""
+            action = data[1] if len(data) > 1 else ""
+            if action in {"page", "noop", "refresh"}:
+                token = data[2]
+                page = max(1, int(data[3])) if len(data) > 3 and data[3].isdigit() else 1
+                mode, payload, expires = self._palette_state.get(token, ("all", "", 0))
+                if expires and expires < time.time():
+                    raise RuntimeError("Панель устарела. Выполни .cmds ещё раз.")
                 rows = self._rows_for(mode, payload)
                 pages = max(1, (len(rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
                 page = min(page, pages)
-                await message.edit_text(self._page_text(rows, page, mode=mode, payload=payload), reply_markup=self._page_keyboard(rows, page, mode=mode, payload=payload))
+                if action == "noop":
+                    await query.answer(f"Страница {page}/{pages}")
+                    return
+                await message.edit_text(
+                    self._page_text(rows, page, mode=mode, payload=payload),
+                    reply_markup=self._page_keyboard(rows, page, mode=mode, payload=payload, token=token),
+                )
+            elif action == "info":
+                token = data[2]
+                mode, payload, expires = self._palette_state.get(token, ("command", "", 0))
+                if expires and expires < time.time():
+                    raise RuntimeError("Кнопка устарела. Выполни .cmds ещё раз.")
+                module_name, command_name = payload.split("|", 1)
+                row = next((r for r in self._rows() if r["module"] == module_name and r["name"] == command_name), None)
+                if row is None:
+                    raise RuntimeError("Команда больше недоступна.")
+                aliases = ", ".join(self.get_prefix() + a for a in row["aliases"]) or "—"
+                await message.edit_text(
+                    "⌨️ <b>Команда</b>\n\n"
+                    f"Имя: <code>{escape(self.get_prefix()+row['name'])}</code>\n"
+                    f"Модуль: <code>{escape(row['module'])}</code>\n"
+                    f"Категория: <code>{escape(row['category'])}</code>\n"
+                    f"Алиасы: <code>{escape(aliases)}</code>\n\n"
+                    f"{escape(row['description'])}",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton("◀️ Назад", callback_data=f"{self.CMD_CALLBACK}home:{self._new_palette_token('all','')}")
+                    ]]),
+                )
+            elif action == "cat":
+                token = data[2]
+                mode, payload, expires = self._palette_state.get(token, ("category", "", 0))
+                if expires and expires < time.time():
+                    raise RuntimeError("Кнопка устарела.")
+                rows = self._rows_for(mode, payload)
+                await message.edit_text(self._page_text(rows, 1, mode=mode, payload=payload), reply_markup=self._page_keyboard(rows, 1, mode=mode, payload=payload, token=token))
+            elif action == "fav":
+                token = data[2]
+                rows = self._rows_for("fav", "")
+                await message.edit_text(self._page_text(rows, 1, mode="fav", payload=""), reply_markup=self._page_keyboard(rows, 1, mode="fav", payload="", token=token))
+            elif action == "cats":
+                categories = self._categories()
+                buttons: list[list[InlineKeyboardButton]] = []
+                category_buttons = [InlineKeyboardButton(f"📁 {cat[:24]}", callback_data=f"{self.CMD_CALLBACK}cat:{self._new_palette_token('category', cat)}") for cat in categories]
+                buttons.extend(category_buttons[i:i+2] for i in range(0, len(category_buttons), 2))
+                buttons.append([InlineKeyboardButton("🏠 Команды", callback_data=f"{self.CMD_CALLBACK}home:{self._new_palette_token('all','')}")])
+                await message.edit_text("📁 <b>Категории команд</b>\n\nВыбери категорию:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons[:25]))
+            elif action == "tip":
+                prefix = self.get_prefix()
+                await message.edit_text(
+                    "🔎 <b>Поиск команд</b>\n\n"
+                    f"<code>{escape(prefix)}cmds search текст</code>\n"
+                    f"<code>{escape(prefix)}cmds module automation</code>\n"
+                    f"<code>{escape(prefix)}cmds 2</code>\n\n"
+                    "Или используй кнопки страниц ниже.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⌨️ Команды", callback_data=f"{self.CMD_CALLBACK}home:{self._new_palette_token('all','')}")]])
+                )
+            elif action == "home":
+                rows = self._rows()
+                await message.edit_text(self._page_text(rows, 1, mode="all", payload=""), reply_markup=self._page_keyboard(rows, 1, mode="all", payload=""))
+            else:
+                await query.answer("Неизвестное действие.", show_alert=True)
+                return
             await query.answer()
         except Exception as exc:
             self.loader.record_runtime_error(self.name, "command_callback", exc)
-            try:
+            with contextlib.suppress(Exception):
                 await query.answer(f"Ошибка: {type(exc).__name__}", show_alert=True)
-            except Exception:
-                pass
 
     # ------------------------- runtime/error tools -------------------------
     @command("history", aliases=("cmdhistory", "chistory"), category="Core")
