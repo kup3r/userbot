@@ -151,6 +151,18 @@ def test_schema_has_core_tables() -> None:
     conn.close()
 
 
+def test_v12_features() -> None:
+    manager = (MODULES / "manager.py").read_text(encoding="utf-8")
+    store = (MODULES / "store.py").read_text(encoding="utf-8")
+    inline = (MODULES / "inline.py").read_text(encoding="utf-8")
+    shortcuts = (MODULES / "shortcuts.py").read_text(encoding="utf-8")
+    assert "PAGE_SIZE = 8" in manager
+    assert "favcmd" in manager and "cmdhub:" in manager
+    assert "_builtin_catalog" in store and "store uninstall" in store
+    assert "_show_commands" in inline and "cmdfav" in inline and "mods_store" in inline
+    assert "class Module(BaseModule)" in shortcuts and "shortcut add" in shortcuts
+
+
 def main() -> None:
     tests = [
         test_python_syntax,
@@ -164,6 +176,7 @@ def main() -> None:
         test_free_render_static_contract,
         test_render_config,
         test_schema_has_core_tables,
+        test_v12_features,
     ]
     for test in tests:
         test()
